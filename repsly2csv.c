@@ -345,6 +345,34 @@ Endpoint endpoints[] = {
         .required_parameters = NULL,
         .default_date_range_days = 30,
         .requires_auth = true
+    },
+    {
+        .name = "retailaudits",
+        .key = "RetailAudits",
+        .pagination_type = ID,
+        .url_format = "https://api.repsly.com/v3/export/retailaudits/%s",
+        .use_raw_timestamp = false,
+        .use_timestamp_pagination = false,
+        .include_inactive = false,
+        .include_deleted = false,
+        .max_page_size = 50,
+        .required_parameters = NULL,
+        .default_date_range_days = 30,
+        .requires_auth = true
+    },
+    {
+        .name = "importstatus",
+        .key = "ImportStatus",
+        .pagination_type = ID,
+        .url_format = "https://api.repsly.com/v3/export/importStatus/%s",
+        .use_raw_timestamp = false,
+        .use_timestamp_pagination = false,
+        .include_inactive = false,
+        .include_deleted = false,
+        .max_page_size = 50,
+        .required_parameters = NULL,
+        .default_date_range_days = 30,
+        .requires_auth = true
     }
 };
 
