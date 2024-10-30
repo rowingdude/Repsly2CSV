@@ -1430,7 +1430,16 @@ void construct_url(char *url, size_t url_size, const Endpoint *endpoint,
         }
         return;
     }
-    
+
+    if (endpoint->pagination_type == DATE_RANGE && (!begin_date || !end_date)) {
+        if (error) {
+            snprintf(error->message, MAX_ERROR_LENGTH, 
+                    "Missing date parameters for date-range pagination");
+            error->code = -1;
+        }
+        return;
+    }
+
     switch (endpoint->pagination_type) {
         case NONE:
         case TIMESTAMP:
