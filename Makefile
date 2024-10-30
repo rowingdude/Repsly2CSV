@@ -1,6 +1,6 @@
 # Compiler and flags
 CC = gcc
-CFLAGS = -Wall -Wextra -O2 -D_GNU_SOURCE
+CFLAGS = -Wall -Wextra -O2 -march=native
 LDFLAGS = -lcurl -ljson-c -lm
 
 # Project name
