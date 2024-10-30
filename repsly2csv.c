@@ -1570,7 +1570,7 @@ int process_endpoint(const Endpoint *endpoint) {
 
     result = 0;
 
- cleanup:
+cleanup:
     if (output_file) fclose(output_file);
     if (chunk.memory) free(chunk.memory);
     if (begin_date) free(begin_date);
@@ -1666,27 +1666,36 @@ void construct_url(char *url, size_t url_size, const Endpoint *endpoint,
     }
 }
 
-
 void add_query_parameters(char *url, size_t url_size, const Endpoint *endpoint) {
     if (!url || !endpoint) return;
     
+    size_t current_len = strlen(url);
+    size_t remaining = url_size - current_len;
+    if (remaining <= 1) return;  // No space left
+
     char *separator = strchr(url, '?') ? "&" : "?";
-    
+    size_t space_needed = 0;
+
     if (endpoint->required_parameters) {
-        snprintf(url + strlen(url), url_size - strlen(url), 
-                "%s%s", separator, endpoint->required_parameters);
+        space_needed = strlen(separator) + strlen(endpoint->required_parameters);
+        if (space_needed < remaining) {
+            snprintf(url + current_len, remaining, "%s%s", 
+                    separator, endpoint->required_parameters);
+            current_len += space_needed;
+            remaining -= space_needed;
+            separator = "&";
+        }
+    }
+
+    if (endpoint->include_inactive && remaining > strlen(separator) + 18) {
+        snprintf(url + current_len, remaining, "%sincludeInactive=true", separator);
+        current_len = strlen(url);
+        remaining = url_size - current_len;
         separator = "&";
     }
-    
-    if (endpoint->include_inactive) {
-        snprintf(url + strlen(url), url_size - strlen(url), 
-                "%sincludeInactive=true", separator);
-        separator = "&";
-    }
-    
-    if (endpoint->include_deleted) {
-        snprintf(url + strlen(url), url_size - strlen(url), 
-                "%sincludeDeleted=true", separator);
+
+    if (endpoint->include_deleted && remaining > strlen(separator) + 17) {
+        snprintf(url + current_len, remaining, "%sincludeDeleted=true", separator);
     }
 }
 
