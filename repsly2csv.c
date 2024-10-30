@@ -1526,6 +1526,15 @@ void save_cache(const char *cache_filename, const char *last_id) {
     }
 }
 
+void cleanup_resources(char *begin_date, char *end_date, MemoryStruct *chunk, 
+                      FILE *output_file, CSVState *csv_state) {
+    free(begin_date);
+    free(end_date);
+    if (chunk && chunk->memory) free(chunk->memory);
+    if (output_file) fclose(output_file);
+    if (csv_state) cleanup_csv_state(csv_state);
+}
+
 void log_message(const char *format, ...) {
     if (!format) return;
     
