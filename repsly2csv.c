@@ -988,6 +988,10 @@ bool is_valid_response(const char *response, const Endpoint *endpoint) {
 bool update_pagination(const Endpoint *endpoint, json_object *parsed_json, 
                       char *last_id, size_t last_id_size, int *skip, 
                       char **begin_date, char **end_date) {
+    if (!endpoint || !parsed_json || !last_id || !skip || !begin_date || !end_date) {
+        return false;
+    }
+
     struct json_object *meta;
     if (!json_object_object_get_ex(parsed_json, "MetaCollectionResult", &meta)) {
         return false;
