@@ -444,6 +444,157 @@ Endpoint endpoints[] = {
 
 static int num_endpoints = sizeof(endpoints) / sizeof(endpoints[0]);
 
+
+void init_job_queue(JobQueue* queue) {
+    queue->front = 0;
+    queue->rear = -1;
+    queue->size = 0;
+    pthread_mutex_init(&queue->mutex, NULL);
+    pthread_cond_init(&queue->not_empty, NULL);
+    pthread_cond_init(&queue->not_full, NULL);
+}
+
+void cleanup_job_queue(JobQueue* queue) {
+    pthread_mutex_destroy(&queue->mutex);
+    pthread_cond_destroy(&queue->not_empty);
+    pthread_cond_destroy(&queue->not_full);
+}
+
+void destroy_job(Job* job) {
+    if (job) {
+        free(job->output_directory);
+        free(job->temp_filename);
+        free(job);
+    }
+}
+
+bool enqueue_job(JobQueue* queue, Job* job) {
+    pthread_mutex_lock(&queue->mutex);
+    
+    while (queue->size >= MAX_QUEUE_SIZE) {
+        pthread_cond_wait(&queue->not_full, &queue->mutex);
+    }
+    
+    queue->rear = (queue->rear + 1) % MAX_QUEUE_SIZE;
+    queue->jobs[queue->rear] = job;
+    queue->size++;
+    
+    pthread_cond_signal(&queue->not_empty);
+    pthread_mutex_unlock(&queue->mutex);
+    return true;
+}
+
+Job* dequeue_job(JobQueue* queue) {
+    pthread_mutex_lock(&queue->mutex);
+    
+    while (queue->size == 0) {
+        pthread_cond_wait(&queue->not_empty, &queue->mutex);
+    }
+    
+    Job* job = queue->jobs[queue->front];
+    queue->front = (queue->front + 1) % MAX_QUEUE_SIZE;
+    queue->size--;
+    
+    pthread_cond_signal(&queue->not_full);
+    pthread_mutex_unlock(&queue->mutex);
+    return job;
+}
+
+Job* create_job(Endpoint* endpoint, const char* output_dir) {
+    Job* job = (Job*)malloc(sizeof(Job));
+    if (!job) return NULL;
+    
+    job->endpoint = endpoint;
+    job->completed = false;
+    job->output_directory = strdup(output_dir);
+    memset(&job->error, 0, sizeof(ErrorInfo));
+    
+    char temp_filename[MAX_URL_LENGTH];
+    snprintf(temp_filename, sizeof(temp_filename), "%s/Repsly_%s_Export.tmp.%s",
+             output_dir, endpoint->key, config.export_format);
+    job->temp_filename = strdup(temp_filename);
+    
+    return job;
+}
+
+void init_thread_safe_rate_limiter(ThreadSafeRateLimiter* limiter) {
+    pthread_mutex_init(&limiter->mutex, NULL);
+    pthread_cond_init(&limiter->rate_limit_cv, NULL);
+    limiter->last_request = 0;
+    limiter->requests_in_window = 0;
+    limiter->window_size = DEFAULT_WINDOW_SIZE;
+    limiter->max_requests = DEFAULT_MAX_REQUESTS;
+    limiter->min_interval = MIN_REQUEST_INTERVAL;
+    limiter->backoff_active = false;
+    limiter->backoff_multiplier = 1;
+    limiter->avg_response_time = 0;
+    limiter->active_requests = 0;
+    limiter->total_requests = 0;
+}
+
+void cleanup_thread_safe_rate_limiter(ThreadSafeRateLimiter* limiter) {
+    pthread_mutex_destroy(&limiter->mutex);
+    pthread_cond_destroy(&limiter->rate_limit_cv);
+}
+
+void* worker_thread(void* arg) {
+    ThreadPool* pool = (ThreadPool*)arg;
+    
+    while (!pool->shutdown) {
+        Job* job = dequeue_job(&pool->job_queue);
+        if (!job) continue;
+        
+        process_endpoint_threaded(job->endpoint, job->temp_filename, pool->rate_limiter, &job->error);
+        job->completed = true;
+        pthread_mutex_lock(&pool->thread_count_mutex);
+        pool->active_threads--;
+        pthread_mutex_unlock(&pool->thread_count_mutex);
+    }
+    
+    return NULL;
+}
+
+int init_thread_pool(ThreadPool* pool, int num_threads) {
+    if (num_threads > MAX_THREADS) num_threads = MAX_THREADS;
+    
+    pool->shutdown = false;
+    pool->active_threads = num_threads;
+    pthread_mutex_init(&pool->thread_count_mutex, NULL);
+    
+    init_job_queue(&pool->job_queue);
+    
+    pool->rate_limiter = (ThreadSafeRateLimiter*)malloc(sizeof(ThreadSafeRateLimiter));
+    init_thread_safe_rate_limiter(pool->rate_limiter);
+    
+    for (int i = 0; i < num_threads; i++) {
+        if (pthread_create(&pool->threads[i], NULL, worker_thread, pool) != 0) {
+            pool->shutdown = true;
+            for (int j = 0; j < i; j++) {
+                pthread_join(pool->threads[j], NULL);
+            }
+            cleanup_job_queue(&pool->job_queue);
+            cleanup_thread_safe_rate_limiter(pool->rate_limiter);
+            free(pool->rate_limiter);
+            return -1;
+        }
+    }
+    
+    return 0;
+}
+
+void cleanup_thread_pool(ThreadPool* pool) {
+    pool->shutdown = true;
+    pthread_cond_broadcast(&pool->job_queue.not_empty);
+    for (int i = 0; i < MAX_THREADS; i++) {
+        pthread_join(pool->threads[i], NULL);
+    }
+    
+    cleanup_job_queue(&pool->job_queue);
+    cleanup_thread_safe_rate_limiter(pool->rate_limiter);
+    free(pool->rate_limiter);
+    pthread_mutex_destroy(&pool->thread_count_mutex);
+}
+
 void initialize_app(void) {
     // Set default configuration values
     config.rate_limit = DEFAULT_RATE_LIMIT_SECONDS;
