@@ -13,12 +13,10 @@
 #include <time.h>
 #include <math.h>
 #include <errno.h>
-#include <pthread.h>
-#include <semaphore.h>
 
 /* Constants */
 #define MAX_URL_LENGTH 512
-#define MAX_BUFFER 16384
+#define MAX_BUFFER 65505
 #define MAX_DATE_LENGTH 64
 #define MAX_ERROR_LENGTH 256
 #define DEFAULT_RATE_LIMIT_SECONDS 1
@@ -26,13 +24,6 @@
 #define DEFAULT_RETRY_ATTEMPTS 3
 #define DEFAULT_TIMEOUT 30
 #define DEFAULT_MAX_ITERATIONS 1000
-#define DEFAULT_WINDOW_SIZE 60  
-#define DEFAULT_MAX_REQUESTS 60 
-#define MIN_REQUEST_INTERVAL 1  
-#define MAX_THREADS 6
-#define MAX_QUEUE_SIZE 12 
-
-volatile sig_atomic_t shutdown_requested = 0;
 
 /* Configuration Structure */
 typedef struct {
@@ -67,6 +58,7 @@ typedef enum {
     DATE_RANGE
 } PaginationType;
 
+/* Endpoint Pagination */
 typedef struct {
     int records_processed;
     int total_records;
@@ -76,6 +68,7 @@ typedef struct {
     time_t last_timestamp;
 } PaginationState;
 
+/* CSV State */
 typedef struct {
     char **headers;
     int header_count;
@@ -83,6 +76,7 @@ typedef struct {
     size_t last_row_size;
 } CSVState;
 
+/* Endpoint Configuration */
 typedef struct {
     const char *name;
     const char *key;
@@ -98,6 +92,7 @@ typedef struct {
     bool requires_auth;
 } Endpoint;
 
+/* Error Handling */
 typedef struct {
     char message[MAX_ERROR_LENGTH];
     int code;
@@ -105,168 +100,83 @@ typedef struct {
     const char *url;
 } ErrorInfo;
 
+#define DEFAULT_WINDOW_SIZE 60  // 1 minute window
+#define DEFAULT_MAX_REQUESTS 60 // Max requests per minute
+#define MIN_REQUEST_INTERVAL 1  // Minimum seconds between requests
+
 typedef struct {
-    time_t last_request;       
-    int requests_in_window;    
-    int window_size;           
-    int max_requests;          
-    double min_interval;       
-    bool backoff_active;       
-    int backoff_multiplier;    
+    time_t last_request;        // Timestamp of last request
+    int requests_in_window;     // Count of requests in current window
+    int window_size;           // Size of the rolling window in seconds
+    int max_requests;          // Maximum requests allowed in window
+    double min_interval;       // Minimum time between requests
+    bool backoff_active;       // Whether exponential backoff is active
+    int backoff_multiplier;    // Current backoff multiplier
 } RateLimiter;
 
-typedef struct {
-    Endpoint* endpoint;
-    char* output_directory;
-    bool completed;
-    ErrorInfo error;
-    char* temp_filename;
-} Job;
 
-typedef struct {
-    Job* jobs[MAX_QUEUE_SIZE];
-    int front;
-    int rear;
-    int size;
-    pthread_mutex_t mutex;
-    pthread_cond_t not_empty;
-    pthread_cond_t not_full;
-} JobQueue;
-
-typedef struct {
-    pthread_t threads[MAX_THREADS];
-    JobQueue job_queue;
-    ThreadSafeRateLimiter* rate_limiter;
-    bool shutdown;
-    int active_threads;
-    pthread_mutex_t thread_count_mutex;
-} ThreadPool;
-
-typedef struct {
-    pthread_mutex_t mutex;
-    pthread_cond_t rate_limit_cv;
-    time_t last_request;
-    int requests_in_window;
-    int window_size;
-    int max_requests;
-    double min_interval;
-    bool backoff_active;
-    int backoff_multiplier;
-    double avg_response_time;
-    int active_requests;
-    int total_requests;
-} ThreadSafeRateLimiter;
-
-typedef struct {
-    char *source_file;
-    char *target_file;
-    bool is_first;
-    const char *format;
-} FileMergeTask;
-
-typedef struct {
-    ThreadPool *pool;
-    bool active;
-} MonitorData;
-
-typedef enum {
-    LOG_DEBUG,
-    LOG_INFO,
-    LOG_WARNING,
-    LOG_ERROR
-} LogLevel;
-
-typedef struct {
-    char url[MAX_URL_LENGTH];
-    MemoryStruct chunk;
-    char last_id[64];
-    PaginationState pagination;
-    int skip;
-    char *begin_date;
-    char *end_date;
-    FILE *output_file;
-    CSVState csv_state;
-    bool first_batch;
-    int result;
-    int records_processed;  // Add this to track records
-} ProcessingContext;
-
-typedef struct {
-    bool inArray;
-    bool skipBrackets;
-    int bracketDepth;
-} JSONMergeContext;
-
-typedef struct {
-    const Endpoint *endpoint;
-    Job **jobs;
-    int count;
-} EndpointGroup;
 
 /* Globals */
 CURL *curl_handle;
 AppConfig config = {0};
 FILE *log_file_ptr = NULL;
 
-pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t curl_mutex = PTHREAD_MUTEX_INITIALIZER;
-
 /* Function Declarations */
 
-/* Core Application Functions */
-void initializeApplication(void);
-void cleanupApplication(void);
-void handleCriticalError(const char *message, ThreadPool *pool);
-void handleSignal(int signum);
+void initialize_app(void);
+void cleanup_app(void);
+void initialize_curl(void);
+void cleanup_curl(void);
 
-/* Thread Pool Management */
-int initializeThreadPool(ThreadPool* pool, int numThreads);
-void cleanupThreadPool(ThreadPool* pool);
-void* workerThreadFunction(void* arg);
-void* monitorThreadFunction(void* arg);
+void parse_command_line(int argc, char *argv[]);
+void validate_config(void);
+void print_help(void);
 
-/* Job Management */
-Job* createJob(Endpoint* endpoint, const char* outputDir);
-void destroyJob(Job* job);
-bool enqueueJob(JobQueue* queue, Job* job);
-Job* dequeueJob(JobQueue* queue);
+void log_message(const char *format, ...);
+void log_error(ErrorInfo *error);
+void handle_error(ErrorInfo *error);
 
-/* Rate Limiting */
-void initializeRateLimiter(ThreadSafeRateLimiter* limiter);
-void applyRateLimit(ThreadSafeRateLimiter* limiter, ErrorInfo* error);
-void handleRateLimitResponse(ThreadSafeRateLimiter* limiter, int httpStatus, int responseTime);
+static size_t write_memory_callback(void *contents, size_t size, size_t nmemb, void *userp);
+int fetch_data(const char* url, MemoryStruct* chunk, ErrorInfo *error);
+int fetch_data_with_backoff(const char* url, MemoryStruct* chunk, int attempt, ErrorInfo *error);
 
-/* Data Processing */
-int processEndpoint(const Endpoint *endpoint, const char *tempFilename, 
-                   ThreadSafeRateLimiter *rateLimiter, ErrorInfo *error);
-int fetchData(const char* url, MemoryStruct* chunk, CURL *threadCurl,
-              ThreadSafeRateLimiter* rateLimiter, ErrorInfo *error);
+char* get_current_datetime(void);
+char* convert_date(const char* date_string);
+void split_date_range(const char *start_date, const char *end_date, char **current_start, char **current_end);
 
-/* File Operations */
-bool mergeFiles(Job **completedJobs, int jobCount, const char *outputDir);
-bool mergeCSVFiles(const char *sourceFile, const char *targetFile, bool isFirst);
-bool mergeJSONFiles(const char *sourceFile, const char *targetFile, bool isFirst);
-void cleanupTempFiles(Job **completedJobs, int jobCount);
+void construct_url(char *url, size_t url_size, const Endpoint *endpoint, 
+                  const char *last_id, int skip, const char *begin_date, 
+                  const char *end_date, ErrorInfo *error);
+void add_query_parameters(char *url, size_t url_size, const Endpoint *endpoint);
 
-/* Utility Functions */
-char* getCurrentDateTime(void);
-char* formatDate(const char* dateString);
-bool validateDateFormat(const char *date);
-void buildRequestURL(char *url, size_t urlSize, const Endpoint *endpoint, 
-                    const char *lastId, int skip, const char *beginDate, 
-                    const char *endDate, ErrorInfo *error);
-void updateJSONBracketDepth(const char *text, JSONMergeContext *ctx);
-void writeJSONHeader(FILE *file, const char *key);
-void writeJSONFooter(FILE *file);
-bool processJSONItems(json_object *items, ProcessingContext *ctx);
-bool processCSVItems(json_object *items, ProcessingContext *ctx);
-void cleanupEndpointGroups(EndpointGroup *groups, int groupCount);
-void parseCommandLine(int argc, char *argv[]);
+bool validate_response_format(const json_object *parsed_json, const Endpoint *endpoint);
+bool is_valid_response(const char *response, const Endpoint *endpoint);
+bool update_pagination(const Endpoint *endpoint, json_object *parsed_json, 
+                      char *last_id, size_t last_id_size, int *skip, 
+                      char **begin_date, char **end_date);
+
+void write_csv_header(FILE *csv_file, json_object *items, CSVState *csv_state);
+void write_csv_row(FILE *csv_file, json_object *item, bool convert_timestamp, CSVState *csv_state);
+void cleanup_csv_state(CSVState *csv_state);
+
+bool load_cache(const char *cache_filename, char *last_id, size_t last_id_size);
+void save_cache(const char *cache_filename, const char *last_id);
+
+int process_endpoint(const Endpoint *endpoint);
+bool is_duplicate_record(json_object *item, const char *last_id, bool use_timestamp);
+
+
+void init_rate_limiter(RateLimiter *limiter);
+void apply_rate_limit(RateLimiter *limiter, ErrorInfo *error);
+void handle_rate_limit_response(RateLimiter *limiter, int http_status);
+void reset_rate_limiter(RateLimiter *limiter);
+void adjust_rate_limits(RateLimiter *limiter, int response_time);
+
 
 Endpoint endpoints[] = {
     {
-        .name = "pricelists",
-        .key = "PriceLists",
+        .name = "pricelists", //ok
+        .key = "Pricelists",
         .pagination_type = NONE,
         .url_format = "https://api.repsly.com/v3/export/pricelists",
         .use_raw_timestamp = false,
@@ -279,7 +189,7 @@ Endpoint endpoints[] = {
         .requires_auth = true
     },
     {
-        .name = "clients",
+        .name = "clients", //ok
         .key = "Clients",
         .pagination_type = TIMESTAMP,
         .url_format = "https://api.repsly.com/v3/export/clients/%s",
@@ -293,7 +203,7 @@ Endpoint endpoints[] = {
         .requires_auth = true
     },
     {
-        .name = "clientnotes",
+        .name = "clientnotes", //ok
         .key = "ClientNotes",
         .pagination_type = ID,
         .url_format = "https://api.repsly.com/v3/export/clientnotes/%s",
@@ -307,7 +217,7 @@ Endpoint endpoints[] = {
         .requires_auth = true
     },
     {
-        .name = "representatives",
+        .name = "representatives", //ok
         .key = "Representatives",
         .pagination_type = NONE,
         .url_format = "https://api.repsly.com/v3/export/representatives",
@@ -321,7 +231,7 @@ Endpoint endpoints[] = {
         .requires_auth = true
     },
     {
-        .name = "forms",
+        .name = "forms",  //ok
         .key = "Forms",
         .pagination_type = ID,
         .url_format = "https://api.repsly.com/v3/export/forms/%s",
@@ -335,7 +245,7 @@ Endpoint endpoints[] = {
         .requires_auth = true
     },
     {
-        .name = "users",
+        .name = "users",   //ok
         .key = "Users",
         .pagination_type = TIMESTAMP,
         .url_format = "https://api.repsly.com/v3/export/users/%s",
@@ -349,7 +259,7 @@ Endpoint endpoints[] = {
         .requires_auth = true
     },
     {
-        .name = "visits",
+        .name = "visits", //ok
         .key = "Visits",
         .pagination_type = TIMESTAMP,
         .url_format = "https://api.repsly.com/v3/export/visits/%s",
@@ -359,25 +269,25 @@ Endpoint endpoints[] = {
         .include_deleted = false,
         .max_page_size = 50,
         .required_parameters = NULL,
-        .default_date_range_days = 7,  // Smaller default range due to volume
+        .default_date_range_days = 7, 
         .requires_auth = true
     },
     {
-        .name = "visitrealizations",
+        .name = "visitrealizations", //ok
         .key = "VisitRealizations",
         .pagination_type = SKIP,
         .url_format = "https://api.repsly.com/v3/export/visitrealizations?modified=%s&skip=%d",
         .use_raw_timestamp = false,
-        .use_timestamp_pagination = false,
+        .use_timestamp_pagination = true,
         .include_inactive = false,
         .include_deleted = false,
         .max_page_size = 50,
         .required_parameters = NULL,
-        .default_date_range_days = 7,  // Smaller default range due to volume
+        .default_date_range_days = 7,
         .requires_auth = true
     },
     {
-        .name = "visitschedules",
+        .name = "visitschedules", //Ok, returns no data but good response
         .key = "VisitSchedules",
         .pagination_type = DATE_RANGE,
         .url_format = "https://api.repsly.com/v3/export/visitschedules/%s/%s",
@@ -387,11 +297,11 @@ Endpoint endpoints[] = {
         .include_deleted = false,
         .max_page_size = 100,
         .required_parameters = NULL,
-        .default_date_range_days = 7,  // Using weekly chunks for better handling
+        .default_date_range_days = 7,  
         .requires_auth = true
     },
     {
-        .name = "dailyworkingtime",
+        .name = "dailyworkingtime", //ok
         .key = "DailyWorkingTime",
         .pagination_type = ID,
         .url_format = "https://api.repsly.com/v3/export/dailyworkingtime/%s",
@@ -405,7 +315,7 @@ Endpoint endpoints[] = {
         .requires_auth = true
     },
     {
-        .name = "products",
+        .name = "products", //ok
         .key = "Products",
         .pagination_type = ID,
         .url_format = "https://api.repsly.com/v3/export/products/%s",
@@ -419,7 +329,7 @@ Endpoint endpoints[] = {
         .requires_auth = true
     },
     {
-        .name = "photos",
+        .name = "photos", //ok
         .key = "Photos",
         .pagination_type = ID,
         .url_format = "https://api.repsly.com/v3/export/photos/%s",
@@ -434,7 +344,7 @@ Endpoint endpoints[] = {
     },
     {
         .name = "documentTypes",
-        .key = "DocumentTypes",
+        .key = "DocumentTypes", //ok
         .pagination_type = NONE,
         .url_format = "https://api.repsly.com/v3/export/documentTypes",
         .use_raw_timestamp = false,
@@ -447,7 +357,7 @@ Endpoint endpoints[] = {
         .requires_auth = true
     },
     {
-        .name = "purchaseorders",
+        .name = "purchaseorders", //Ok, returns no data but good response
         .key = "PurchaseOrders",
         .pagination_type = ID,
         .url_format = "https://api.repsly.com/v3/export/purchaseorders/%s",
@@ -462,7 +372,7 @@ Endpoint endpoints[] = {
     },
     {
         .name = "retailaudits",
-        .key = "RetailAudits",
+        .key = "RetailAudits", //ok
         .pagination_type = ID,
         .url_format = "https://api.repsly.com/v3/export/retailaudits/%s",
         .use_raw_timestamp = false,
@@ -473,10 +383,10 @@ Endpoint endpoints[] = {
         .required_parameters = NULL,
         .default_date_range_days = 30,
         .requires_auth = true
-    },
-    {
-        .name = "importstatus",
-        .key = "ImportStatus",
+    }
+ /*   {               // We need to implement the import funcitonality for this to work.
+        .name = "importstatus",  
+        .key = "importStatus",
         .pagination_type = ID,
         .url_format = "https://api.repsly.com/v3/export/importStatus/%s",
         .use_raw_timestamp = false,
@@ -487,15 +397,13 @@ Endpoint endpoints[] = {
         .required_parameters = NULL,
         .default_date_range_days = 30,
         .requires_auth = true
-    }
+    } */
 };
 
 static int num_endpoints = sizeof(endpoints) / sizeof(endpoints[0]);
 
-
-/* Core Application Functions */
-void initializeApplication(void) {
-    // Initialize configuration
+void initialize_app(void) {
+    // Set default configuration values
     config.rate_limit = DEFAULT_RATE_LIMIT_SECONDS;
     config.page_size = DEFAULT_PAGE_SIZE;
     config.retry_attempts = DEFAULT_RETRY_ATTEMPTS;
@@ -505,13 +413,9 @@ void initializeApplication(void) {
     config.max_iterations = DEFAULT_MAX_ITERATIONS;
     
     // Initialize CURL
-    curl_global_init(CURL_GLOBAL_ALL);
-    curl_handle = curl_easy_init();
-    if (!curl_handle) {
-        handleCriticalError("Failed to initialize CURL", NULL);
-    }
+    initialize_curl();
     
-    // Initialize logging
+    // Open log file if specified
     if (config.log_file) {
         log_file_ptr = fopen(config.log_file, "a");
         if (!log_file_ptr) {
@@ -519,1129 +423,68 @@ void initializeApplication(void) {
                     config.log_file, strerror(errno));
         }
     }
-
-    // Initialize mutexes
-    pthread_mutex_init(&log_mutex, NULL);
-    pthread_mutex_init(&curl_mutex, NULL);
 }
 
-void cleanupApplication(void) {
-    // Cleanup CURL
+void cleanup_app(void) {
+    cleanup_curl();
+    if (log_file_ptr) {
+        fclose(log_file_ptr);
+    }
+}
+
+void initialize_curl(void) {
+    curl_global_init(CURL_GLOBAL_ALL);
+    curl_handle = curl_easy_init();
+    if (!curl_handle) {
+        fprintf(stderr, "Error: Failed to initialize CURL\n");
+        exit(1);
+    }
+}
+
+void cleanup_curl(void) {
     if (curl_handle) {
         curl_easy_cleanup(curl_handle);
         curl_handle = NULL;
     }
     curl_global_cleanup();
-    
-    // Cleanup logging
-    if (log_file_ptr) {
-        fclose(log_file_ptr);
-        log_file_ptr = NULL;
-    }
-    
-    // Cleanup mutexes
-    pthread_mutex_destroy(&log_mutex);
-    pthread_mutex_destroy(&curl_mutex);
-    
-    // Cleanup configuration
-    free(config.specific_endpoint);
-    free(config.output_directory);
-    free(config.from_date);
-    free(config.to_date);
-    if (config.export_format && strcmp(config.export_format, "csv") != 0) {
-        free(config.export_format);
-    }
-    free(config.log_file);
 }
 
-void handleCriticalError(const char *message, ThreadPool *pool) {
-    logMessage(LOG_ERROR, "CRITICAL ERROR: %s", message);
-    
-    if (pool) {
-        cleanupThreadPool(pool);
-    }
-    cleanupApplication();
-    exit(1);
-}
-
-void handleSignal(int signum) {
-    char *signal_name = (signum == SIGINT) ? "SIGINT" : "SIGTERM";
-    logMessage(LOG_INFO, "Received %s signal, initiating graceful shutdown...", signal_name);
-    shutdown_requested = 1;
-}
-
-
-
-
-/* Thread Pool Management */
-int initializeThreadPool(ThreadPool* pool, int numThreads) {
-    if (!pool || numThreads <= 0) return -1;
-    if (numThreads > MAX_THREADS) numThreads = MAX_THREADS;
-    
-    // Initialize pool state
-    pool->shutdown = false;
-    pool->active_threads = numThreads;
-    
-    // Initialize mutexes and job queue
-    if (pthread_mutex_init(&pool->thread_count_mutex, NULL) != 0) {
-        return -1;
-    }
-    
-    if (initializeJobQueue(&pool->job_queue) != 0) {
-        pthread_mutex_destroy(&pool->thread_count_mutex);
-        return -1;
-    }
-    
-    // Initialize rate limiter
-    pool->rate_limiter = malloc(sizeof(ThreadSafeRateLimiter));
-    if (!pool->rate_limiter) {
-        cleanupJobQueue(&pool->job_queue);
-        pthread_mutex_destroy(&pool->thread_count_mutex);
-        return -1;
-    }
-    initializeRateLimiter(pool->rate_limiter);
-    
-    // Create worker threads
-    for (int i = 0; i < numThreads; i++) {
-        if (pthread_create(&pool->threads[i], NULL, workerThreadFunction, pool) != 0) {
-            pool->shutdown = true;
-            // Wait for already created threads
-            for (int j = 0; j < i; j++) {
-                pthread_join(pool->threads[j], NULL);
-            }
-            cleanupJobQueue(&pool->job_queue);
-            free(pool->rate_limiter);
-            pthread_mutex_destroy(&pool->thread_count_mutex);
-            return -1;
-        }
-    }
-    
-    return 0;
-}
-
-void cleanupThreadPool(ThreadPool* pool) {
-    if (!pool) return;
-    
-    // Signal shutdown
-    pool->shutdown = true;
-    
-    // Wake up all waiting threads
-    pthread_mutex_lock(&pool->job_queue.mutex);
-    pthread_cond_broadcast(&pool->job_queue.not_empty);
-    pthread_cond_broadcast(&pool->job_queue.not_full);
-    pthread_mutex_unlock(&pool->job_queue.mutex);
-    
-    // Wait for all threads to finish
-    for (int i = 0; i < MAX_THREADS; i++) {
-        pthread_join(pool->threads[i], NULL);
-    }
-    
-    // Cleanup remaining jobs
-    cleanupRemainingJobs(&pool->job_queue);
-    
-    // Cleanup synchronization primitives and resources
-    pthread_mutex_destroy(&pool->thread_count_mutex);
-    cleanupJobQueue(&pool->job_queue);
-    
-    if (pool->rate_limiter) {
-        cleanupRateLimiter(pool->rate_limiter);
-        free(pool->rate_limiter);
-    }
-}
-
-void* workerThreadFunction(void* arg) {
-    ThreadPool* pool = (ThreadPool*)arg;
-    
-    while (!pool->shutdown) {
-        // Get next job
-        Job* job = dequeueJob(&pool->job_queue);
-        if (!job) continue;
-        
-        // Process the job
-        processEndpoint(job->endpoint, job->temp_filename, 
-                       pool->rate_limiter, &job->error);
-        
-        // Update job and thread status
-        job->completed = true;
-        
-        pthread_mutex_lock(&pool->thread_count_mutex);
-        pool->active_threads--;
-        pthread_mutex_unlock(&pool->thread_count_mutex);
-        
-        // Log completion
-        logMessage(LOG_INFO, "Completed processing endpoint: %s", 
-                  job->endpoint->name);
-    }
-    
-    return NULL;
-}
-
-void* monitorThreadFunction(void* arg) {
-    MonitorData* data = (MonitorData*)arg;
-    ThreadPool* pool = data->pool;
-    
-    while (data->active && !shutdown_requested) {
-        pthread_mutex_lock(&pool->thread_count_mutex);
-        
-        logMessage(LOG_DEBUG, 
-                  "Thread Pool Status - Active threads: %d, Queue size: %d, "
-                  "Rate limit status: %d/%d requests",
-                  pool->active_threads, 
-                  pool->job_queue.size,
-                  pool->rate_limiter->requests_in_window,
-                  pool->rate_limiter->max_requests);
-        
-        pthread_mutex_unlock(&pool->thread_count_mutex);
-        
-        sleep(5);  // Monitor every 5 seconds
-    }
-    
-    return NULL;
-}
-
-
-
-/* Job Management */
-Job* createJob(Endpoint* endpoint, const char* outputDir) {
-    if (!endpoint || !outputDir) return NULL;
-    
-    Job* job = (Job*)malloc(sizeof(Job));
-    if (!job) {
-        logMessage(LOG_ERROR, "Failed to allocate memory for job");
-        return NULL;
-    }
-    
-    // Initialize basic job properties
-    job->endpoint = endpoint;
-    job->completed = false;
-    job->output_directory = strdup(outputDir);
-    memset(&job->error, 0, sizeof(ErrorInfo));
-    
-    // Create unique temporary filename
-    char temp_filename[MAX_URL_LENGTH];
-    snprintf(temp_filename, sizeof(temp_filename), "%s/Repsly_%s_Export_%ld.tmp.%s",
-             outputDir, endpoint->key, (long)time(NULL), config.export_format);
-    job->temp_filename = strdup(temp_filename);
-    
-    if (!job->output_directory || !job->temp_filename) {
-        logMessage(LOG_ERROR, "Failed to allocate strings for job");
-        destroyJob(job);
-        return NULL;
-    }
-    
-    return job;
-}
-
-void destroyJob(Job* job) {
-    if (!job) return;
-    
-    free(job->output_directory);
-    free(job->temp_filename);
-    free(job);
-}
-
-int initializeJobQueue(JobQueue* queue) {
-    if (!queue) return -1;
-    
-    queue->front = 0;
-    queue->rear = -1;
-    queue->size = 0;
-    
-    if (pthread_mutex_init(&queue->mutex, NULL) != 0) {
-        return -1;
-    }
-    if (pthread_cond_init(&queue->not_empty, NULL) != 0) {
-        pthread_mutex_destroy(&queue->mutex);
-        return -1;
-    }
-    if (pthread_cond_init(&queue->not_full, NULL) != 0) {
-        pthread_mutex_destroy(&queue->mutex);
-        pthread_cond_destroy(&queue->not_empty);
-        return -1;
-    }
-    
-    return 0;
-}
-
-void cleanupJobQueue(JobQueue* queue) {
-    if (!queue) return;
-    
-    pthread_mutex_destroy(&queue->mutex);
-    pthread_cond_destroy(&queue->not_empty);
-    pthread_cond_destroy(&queue->not_full);
-}
-
-bool enqueueJob(JobQueue* queue, Job* job) {
-    if (!queue || !job) return false;
-    
-    pthread_mutex_lock(&queue->mutex);
-    
-    while (queue->size >= MAX_QUEUE_SIZE && !shutdown_requested) {
-        pthread_cond_wait(&queue->not_full, &queue->mutex);
-    }
-    
-    if (shutdown_requested) {
-        pthread_mutex_unlock(&queue->mutex);
-        return false;
-    }
-    
-    queue->rear = (queue->rear + 1) % MAX_QUEUE_SIZE;
-    queue->jobs[queue->rear] = job;
-    queue->size++;
-    
-    pthread_cond_signal(&queue->not_empty);
-    pthread_mutex_unlock(&queue->mutex);
-    
-    logMessage(LOG_DEBUG, "Enqueued job for endpoint: %s", job->endpoint->name);
-    return true;
-}
-
-Job* dequeueJob(JobQueue* queue) {
-    if (!queue) return NULL;
-    
-    pthread_mutex_lock(&queue->mutex);
-    
-    while (queue->size == 0 && !shutdown_requested) {
-        pthread_cond_wait(&queue->not_empty, &queue->mutex);
-    }
-    
-    if (shutdown_requested && queue->size == 0) {
-        pthread_mutex_unlock(&queue->mutex);
-        return NULL;
-    }
-    
-    Job* job = queue->jobs[queue->front];
-    queue->front = (queue->front + 1) % MAX_QUEUE_SIZE;
-    queue->size--;
-    
-    pthread_cond_signal(&queue->not_full);
-    pthread_mutex_unlock(&queue->mutex);
-    
-    if (job) {
-        logMessage(LOG_DEBUG, "Dequeued job for endpoint: %s", job->endpoint->name);
-    }
-    return job;
-}
-
-void cleanupRemainingJobs(JobQueue* queue) {
-    if (!queue) return;
-    
-    pthread_mutex_lock(&queue->mutex);
-    while (queue->size > 0) {
-        Job* job = queue->jobs[queue->front];
-        if (job) {
-            destroyJob(job);
-        }
-        queue->front = (queue->front + 1) % MAX_QUEUE_SIZE;
-        queue->size--;
-    }
-    pthread_mutex_unlock(&queue->mutex);
-}
-
-
-
-
-/* Rate Limiting */
-void initializeRateLimiter(ThreadSafeRateLimiter* limiter) {
-    if (!limiter) return;
-    
-    if (pthread_mutex_init(&limiter->mutex, NULL) != 0 ||
-        pthread_cond_init(&limiter->rate_limit_cv, NULL) != 0) {
-        handleCriticalError("Failed to initialize rate limiter synchronization", NULL);
-    }
-    
-    limiter->last_request = 0;
-    limiter->requests_in_window = 0;
-    limiter->window_size = DEFAULT_WINDOW_SIZE;
-    limiter->max_requests = DEFAULT_MAX_REQUESTS;
-    limiter->min_interval = MIN_REQUEST_INTERVAL;
-    limiter->backoff_active = false;
-    limiter->backoff_multiplier = 1;
-    limiter->avg_response_time = 0;
-    limiter->active_requests = 0;
-    limiter->total_requests = 0;
-}
-
-void cleanupRateLimiter(ThreadSafeRateLimiter* limiter) {
-    if (!limiter) return;
-    
-    pthread_mutex_destroy(&limiter->mutex);
-    pthread_cond_destroy(&limiter->rate_limit_cv);
-}
-
-void applyRateLimit(ThreadSafeRateLimiter* limiter, ErrorInfo* error) {
-    if (!limiter) return;
-    
-    struct timespec wait_time;
-    pthread_mutex_lock(&limiter->mutex);
-    
-    time_t now = time(NULL);
-    double time_since_last = difftime(now, limiter->last_request);
-    
-    // Handle minimum interval
-    if (time_since_last < limiter->min_interval) {
-        clock_gettime(CLOCK_REALTIME, &wait_time);
-        wait_time.tv_sec += (time_t)ceil(limiter->min_interval - time_since_last);
-        pthread_cond_timedwait(&limiter->rate_limit_cv, &limiter->mutex, &wait_time);
-    }
-    
-    // Reset window if needed
-    if (difftime(now, limiter->last_request) >= limiter->window_size) {
-        limiter->requests_in_window = 0;
-        limiter->last_request = now;
-    }
-    
-    // Apply exponential backoff if active
-    if (limiter->backoff_active) {
-        clock_gettime(CLOCK_REALTIME, &wait_time);
-        wait_time.tv_sec += (time_t)(limiter->min_interval * limiter->backoff_multiplier);
-        pthread_cond_timedwait(&limiter->rate_limit_cv, &limiter->mutex, &wait_time);
-    }
-    
-    // Wait if at rate limit
-    while (limiter->requests_in_window >= limiter->max_requests) {
-        clock_gettime(CLOCK_REALTIME, &wait_time);
-        wait_time.tv_sec = limiter->last_request + limiter->window_size;
-        pthread_cond_timedwait(&limiter->rate_limit_cv, &limiter->mutex, &wait_time);
-        
-        now = time(NULL);
-        if (difftime(now, limiter->last_request) >= limiter->window_size) {
-            limiter->requests_in_window = 0;
-            limiter->last_request = now;
-        }
-    }
-    
-    // Update state
-    limiter->requests_in_window++;
-    limiter->active_requests++;
-    limiter->last_request = now;
-    limiter->total_requests++;
-    
-    pthread_mutex_unlock(&limiter->mutex);
-}
-
-void handleRateLimitResponse(ThreadSafeRateLimiter* limiter, int httpStatus, int responseTime) {
-    if (!limiter) return;
-    
-    pthread_mutex_lock(&limiter->mutex);
-    
-    limiter->active_requests--;
-    
-    // Update moving average of response time
-    limiter->avg_response_time = (0.1 * responseTime) + 
-                                (0.9 * limiter->avg_response_time);
-    
-    // Handle response status
-    switch (httpStatus) {
-        case 429: // Too Many Requests
-            limiter->backoff_active = true;
-            limiter->backoff_multiplier *= 2;
-            if (limiter->backoff_multiplier > 32) {
-                limiter->backoff_multiplier = 32;
-            }
-            logMessage(LOG_WARNING, "Rate limit exceeded, backing off (multiplier: %d)", 
-                      limiter->backoff_multiplier);
-            break;
-            
-        case 200: // Success
-            if (limiter->backoff_active) {
-                limiter->backoff_multiplier = limiter->backoff_multiplier > 1 ? 
-                                            limiter->backoff_multiplier / 2 : 1;
-                if (limiter->backoff_multiplier == 1) {
-                    limiter->backoff_active = false;
-                    logMessage(LOG_INFO, "Rate limit backoff deactivated");
-                }
-            }
-            break;
-            
-        default:
-            if (!limiter->backoff_active) {
-                limiter->backoff_active = true;
-                limiter->backoff_multiplier = 1;
-                logMessage(LOG_WARNING, "Unexpected response, activating rate limit backoff");
-            }
-            break;
-    }
-    
-    // Adjust rate limits based on performance
-    adjustRateLimits(limiter);
-    
-    pthread_cond_broadcast(&limiter->rate_limit_cv);
-    pthread_mutex_unlock(&limiter->mutex);
-}
-
-void adjustRateLimits(ThreadSafeRateLimiter* limiter) {
-    if (!limiter) return;
-    
-    if (limiter->avg_response_time > 2000) {
-        limiter->max_requests = (int)(limiter->max_requests * 0.8);
-        if (limiter->max_requests < 10) limiter->max_requests = 10;
-        logMessage(LOG_DEBUG, "Reducing rate limit to %d requests per window", 
-                  limiter->max_requests);
-    } else if (limiter->avg_response_time < 500 && 
-               limiter->max_requests < DEFAULT_MAX_REQUESTS) {
-        limiter->max_requests = (int)(limiter->max_requests * 1.1);
-        if (limiter->max_requests > DEFAULT_MAX_REQUESTS) {
-            limiter->max_requests = DEFAULT_MAX_REQUESTS;
-        }
-        logMessage(LOG_DEBUG, "Increasing rate limit to %d requests per window", 
-                  limiter->max_requests);
-    }
-}
-
-
-
-/* Data Processing */
-int processEndpoint(const Endpoint *endpoint, const char *tempFilename, 
-                   ThreadSafeRateLimiter *rateLimiter, ErrorInfo *error) {
-    if (!endpoint || !tempFilename || !rateLimiter || !error) {
-        setError(error, "Invalid parameters for endpoint processing", -1);
-        return -1;
-    }
-
-    ProcessingContext ctx = {
-        .url = {0},
-        .chunk = {0},
-        .last_id = "0",
-        .pagination = {0},
-        .skip = 0,
-        .begin_date = NULL,
-        .end_date = NULL,
-        .output_file = NULL,
-        .csv_state = {0},
-        .first_batch = true,
-        .result = -1
-    };
-
-    // Initialize dates
-    if (!initializeDateRange(endpoint, &ctx.begin_date, &ctx.end_date)) {
-        setError(error, "Failed to initialize date range", -1);
-        goto cleanup;
-    }
-
-    // Initialize memory chunk
-    ctx.chunk.memory = malloc(1);
-    if (!ctx.chunk.memory) {
-        setError(error, "Failed to allocate initial memory", -1);
-        goto cleanup;
-    }
-    ctx.chunk.size = 0;
-
-    // Initialize CURL
-    CURL *thread_curl = curl_easy_init();
-    if (!thread_curl) {
-        setError(error, "Failed to initialize CURL", -1);
-        goto cleanup;
-    }
-
-    // Open output file
-    ctx.output_file = openOutputFile(tempFilename, error);
-    if (!ctx.output_file) goto cleanup;
-
-    // Write JSON header if needed
-    if (isJSONFormat()) {
-        writeJSONHeader(ctx.output_file, endpoint->key);
-    }
-
-    // Initialize pagination
-    ctx.pagination.page_number = 1;
-    ctx.pagination.has_more = true;
-    ctx.pagination.records_processed = 0;
-
-    // Main processing loop
-    while (shouldContinueProcessing(&ctx.pagination) && !shutdown_requested) {
-        // Build request URL
-        if (!buildRequestURL(ctx.url, sizeof(ctx.url), endpoint, ctx.last_id, 
-                           ctx.skip, ctx.begin_date, ctx.end_date, error)) {
-            goto cleanup;
-        }
-
-        // Log request if verbose
-        logRequestDetails(endpoint, &ctx.pagination, ctx.url);
-
-        // Fetch and process data
-        if (!fetchAndProcessData(endpoint, &ctx, thread_curl, rateLimiter, error)) {
-            goto cleanup;
-        }
-
-        // Update pagination state
-        if (!updatePaginationState(endpoint, &ctx)) {
-            ctx.pagination.has_more = false;
-        }
-    }
-
-    // Write JSON footer if needed
-    if (isJSONFormat()) {
-        writeJSONFooter(ctx.output_file);
-    }
-
-    ctx.result = 0;
-
-cleanup:
-    cleanupProcessingContext(&ctx, thread_curl);
-    return ctx.result;
-}
-
-bool fetchAndProcessData(const Endpoint *endpoint, ProcessingContext *ctx, 
-                        CURL *thread_curl, ThreadSafeRateLimiter *rateLimiter, 
-                        ErrorInfo *error) {
-    bool success = false;
-    
-    // Attempt fetch with retries
-    for (int retry = 0; retry < config.retry_attempts && !shutdown_requested; retry++) {
-        if (fetchData(ctx->url, &ctx->chunk, thread_curl, rateLimiter, error) == 0) {
-            success = true;
-            break;
-        }
-        
-        if (shouldAbortRetry(error)) break;
-        handleFetchError(error, retry);
-    }
-
-    if (!success) {
-        logMessage(LOG_ERROR, "Failed to fetch data after %d attempts", 
-                  config.retry_attempts);
-        return false;
-    }
-
-    // Parse and validate response
-    json_object *parsed_json = parseAndValidateResponse(ctx->chunk.memory, endpoint, error);
-    if (!parsed_json) return false;
-
-    // Process response data
-    success = processResponseData(endpoint, parsed_json, ctx);
-    
-    json_object_put(parsed_json);
-    return success;
-}
-
-int fetchData(const char* url, MemoryStruct* chunk, CURL *thread_curl,
-              ThreadSafeRateLimiter* rateLimiter, ErrorInfo *error) {
-    // Apply rate limiting
-    applyRateLimit(rateLimiter, error);
-    if (error->code != 0) return -1;
-
-    CURLcode res;
-    struct curl_slist *headers = NULL;
-    long response_code = 0;
-    double response_time = 0;
-
-    pthread_mutex_lock(&curl_mutex);
-    
-    // Setup request
-    if (!setupCURLRequest(thread_curl, url, chunk, &headers, error)) {
-        pthread_mutex_unlock(&curl_mutex);
-        return -1;
-    }
-
-    // Perform request
-    res = curl_easy_perform(thread_curl);
-    
-    if (res != CURLE_OK) {
-        handleCURLError(res, error);
-        curl_slist_free_all(headers);
-        pthread_mutex_unlock(&curl_mutex);
-        return -1;
-    }
-
-    // Get response info
-    curl_easy_getinfo(thread_curl, CURLINFO_RESPONSE_CODE, &response_code);
-    curl_easy_getinfo(thread_curl, CURLINFO_TOTAL_TIME, &response_time);
-
-    curl_slist_free_all(headers);
-    pthread_mutex_unlock(&curl_mutex);
-
-    // Handle rate limiting
-    handleRateLimitResponse(rateLimiter, response_code, (int)(response_time * 1000));
-
-    // Check response code
-    if (response_code != 200) {
-        setError(error, "HTTP error", response_code);
-        return -1;
-    }
-
-    return 0;
-}
-
-
-
-/* File Operations */
-bool mergeFiles(Job **completedJobs, int jobCount, const char *outputDir) {
-    if (jobCount == 0 || !outputDir) return true;
-
-    EndpointGroup *groups = createEndpointGroups(completedJobs, jobCount);
-    if (!groups) {
-        logMessage(LOG_ERROR, "Failed to create endpoint groups");
-        return false;
-    }
-
-    int groupCount = populateEndpointGroups(groups, completedJobs, jobCount);
-    bool success = processEndpointGroups(groups, groupCount, outputDir);
-
-    // Cleanup
-    cleanupEndpointGroups(groups, groupCount);
-    
-    if (success) {
-        cleanupTempFiles(completedJobs, jobCount);
-    }
-
-    return success;
-}
-
-EndpointGroup* createEndpointGroups(Job **jobs, int jobCount) {
-    EndpointGroup *groups = calloc(num_endpoints, sizeof(EndpointGroup));
-    if (!groups) return NULL;
-
-    // Initialize groups
-    for (int i = 0; i < num_endpoints; i++) {
-        groups[i].endpoint = NULL;
-        groups[i].jobs = NULL;
-        groups[i].count = 0;
-    }
-
-    return groups;
-}
-
-int populateEndpointGroups(EndpointGroup *groups, Job **jobs, int jobCount) {
-    int groupCount = 0;
-
-    // Count jobs per endpoint
-    for (int i = 0; i < jobCount; i++) {
-        if (!jobs[i]) continue;
-
-        bool found = false;
-        for (int j = 0; j < groupCount; j++) {
-            if (groups[j].endpoint == jobs[i]->endpoint) {
-                groups[j].count++;
-                found = true;
-                break;
-            }
-        }
-
-        if (!found) {
-            groups[groupCount].endpoint = jobs[i]->endpoint;
-            groups[groupCount].count = 1;
-            groupCount++;
-        }
-    }
-
-    // Allocate job arrays
-    for (int i = 0; i < groupCount; i++) {
-        groups[i].jobs = calloc(groups[i].count, sizeof(Job*));
-        if (!groups[i].jobs) {
-            return -1;
-        }
-    }
-
-    // Fill job arrays
-    int *indices = calloc(groupCount, sizeof(int));
-    for (int i = 0; i < jobCount; i++) {
-        if (!jobs[i]) continue;
-
-        for (int j = 0; j < groupCount; j++) {
-            if (groups[j].endpoint == jobs[i]->endpoint) {
-                groups[j].jobs[indices[j]++] = jobs[i];
-                break;
-            }
-        }
-    }
-
-    free(indices);
-    return groupCount;
-}
-
-bool processEndpointGroups(EndpointGroup *groups, int groupCount, const char *outputDir) {
-    bool success = true;
-
-    for (int i = 0; i < groupCount && !shutdown_requested; i++) {
-        char finalFilename[MAX_URL_LENGTH];
-        snprintf(finalFilename, sizeof(finalFilename), "%s/Repsly_%s_Export.%s",
-                outputDir, groups[i].endpoint->key, config.export_format);
-
-        if (!mergeGroupFiles(&groups[i], finalFilename)) {
-            logMessage(LOG_ERROR, "Failed to merge files for endpoint: %s", 
-                      groups[i].endpoint->name);
-            success = false;
-            break;
-        }
-    }
-
-    return success;
-}
-
-bool mergeGroupFiles(EndpointGroup *group, const char *finalFilename) {
-    for (int i = 0; i < group->count; i++) {
-        bool isFirst = (i == 0);
-        bool mergeSuccess;
-
-        if (isJSONFormat()) {
-            mergeSuccess = mergeJSONFiles(group->jobs[i]->temp_filename,
-                                        finalFilename, isFirst);
-        } else {
-            mergeSuccess = mergeCSVFiles(group->jobs[i]->temp_filename,
-                                       finalFilename, isFirst);
-        }
-
-        if (!mergeSuccess) return false;
-    }
-
-    return validateMergedFile(finalFilename);
-}
-
-bool mergeCSVFiles(const char *sourceFile, const char *targetFile, bool isFirst) {
-    FILE *source = fopen(sourceFile, "r");
-    if (!source) {
-        logMessage(LOG_ERROR, "Failed to open source file: %s", sourceFile);
-        return false;
-    }
-
-    FILE *target = fopen(targetFile, isFirst ? "w" : "a");
-    if (!target) {
-        fclose(source);
-        logMessage(LOG_ERROR, "Failed to open target file: %s", targetFile);
-        return false;
-    }
-
-    char buffer[MAX_BUFFER];
-    bool skipHeader = !isFirst;
-    bool firstLine = true;
-
-    while (fgets(buffer, sizeof(buffer), source) && !shutdown_requested) {
-        if (skipHeader && firstLine) {
-            firstLine = false;
-            continue;
-        }
-        fputs(buffer, target);
-    }
-
-    fclose(source);
-    fclose(target);
-    return true;
-}
-
-bool mergeJSONFiles(const char *sourceFile, const char *targetFile, bool isFirst) {
-    FILE *source = fopen(sourceFile, "r");
-    if (!source) {
-        logMessage(LOG_ERROR, "Failed to open source file: %s", sourceFile);
-        return false;
-    }
-
-    FILE *target = fopen(targetFile, isFirst ? "w" : "a");
-    if (!target) {
-        fclose(source);
-        logMessage(LOG_ERROR, "Failed to open target file: %s", targetFile);
-        return false;
-    }
-
-    JSONMergeContext ctx = {
-        .inArray = false,
-        .skipBrackets = !isFirst,
-        .bracketDepth = 0
-    };
-
-    if (!mergeJSONContent(source, target, &ctx)) {
-        fclose(source);
-        fclose(target);
-        return false;
-    }
-
-    fclose(source);
-    fclose(target);
-    return true;
-}
-
-bool mergeJSONContent(FILE *source, FILE *target, JSONMergeContext *ctx) {
-    char buffer[MAX_BUFFER];
-
-    while (fgets(buffer, sizeof(buffer), source) && !shutdown_requested) {
-        char *pos = buffer;
-        
-        if (ctx->skipBrackets) {
-            char *bracketPos = strchr(buffer, '[');
-            if (bracketPos) {
-                pos = bracketPos + 1;
-                ctx->skipBrackets = false;
-            } else {
-                continue;
-            }
-        }
-
-        if (!ctx->inArray && !ctx->skipBrackets) {
-            if (strchr(pos, '[')) {
-                ctx->inArray = true;
-                fprintf(target, ",\n");
-            }
-        }
-
-        updateJSONBracketDepth(pos, ctx);
-        fputs(pos, target);
-    }
-
-    return true;
-}
-
-void cleanupTempFiles(Job **completedJobs, int jobCount) {
-    for (int i = 0; i < jobCount; i++) {
-        if (completedJobs[i] && completedJobs[i]->temp_filename) {
-            if (remove(completedJobs[i]->temp_filename) != 0) {
-                logMessage(LOG_WARNING, "Failed to remove temporary file: %s", 
-                          completedJobs[i]->temp_filename);
-            }
-        }
-    }
-}
-
-bool validateMergedFile(const char *filename) {
-    FILE *file = fopen(filename, "r");
-    if (!file) return false;
-
-    bool isValid = true;
-    char buffer[MAX_BUFFER];
-
-    if (isJSONFormat()) {
-        isValid = validateJSONStructure(file);
-    } else {
-        isValid = validateCSVStructure(file);
-    }
-
-    fclose(file);
-    return isValid;
-}
-
-bool validateJSONStructure(FILE *file) {
-    char buffer[MAX_BUFFER];
-    int braceCount = 0;
-    int bracketCount = 0;
-    
-    while (fgets(buffer, sizeof(buffer), file) && !shutdown_requested) {
-        for (char *p = buffer; *p; p++) {
-            switch (*p) {
-                case '{': braceCount++; break;
-                case '}': braceCount--; break;
-                case '[': bracketCount++; break;
-                case ']': bracketCount--; break;
-            }
-            
-            if (braceCount < 0 || bracketCount < 0) return false;
-        }
-    }
-    
-    return (braceCount == 0 && bracketCount == 0);
-}
-
-bool validateCSVStructure(FILE *file) {
-    char buffer[MAX_BUFFER];
-    int expectedFields = -1;
-    int lineNumber = 0;
-    
-    while (fgets(buffer, sizeof(buffer), file) && 
-           lineNumber < 10 && !shutdown_requested) {
-        int currentFields = countCSVFields(buffer);
-        
-        if (expectedFields == -1) {
-            expectedFields = currentFields;
-        } else if (currentFields != expectedFields) {
-            return false;
-        }
-        
-        lineNumber++;
-    }
-    
-    return (lineNumber > 0);
-}
-
-int countCSVFields(const char *line) {
-    int fields = 1;
-    bool inQuotes = false;
-    
-    for (const char *p = line; *p; p++) {
-        if (*p == '"') {
-            inQuotes = !inQuotes;
-        } else if (*p == ',' && !inQuotes) {
-            fields++;
-        }
-    }
-    
-    return fields;
-}
-
-
-
-/* Utility Functions */
-void logMessage(LogLevel level, const char *format, ...) {
-    if (!format) return;
-    
-    pthread_mutex_lock(&log_mutex);
+void log_error(ErrorInfo *error) {
+    if (!error) return;
     
     time_t now = time(NULL);
     char timestamp[26];
-    struct tm tm_info;
-    localtime_r(&now, &tm_info);
-    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", &tm_info);
-    
-    const char *level_str = "";
-    switch (level) {
-        case LOG_DEBUG:   level_str = "DEBUG"; break;
-        case LOG_INFO:    level_str = "INFO"; break;
-        case LOG_WARNING: level_str = "WARNING"; break;
-        case LOG_ERROR:   level_str = "ERROR"; break;
-    }
-    
-    va_list args;
-    va_start(args, format);
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", localtime(&now));
     
     if (log_file_ptr) {
-        fprintf(log_file_ptr, "[%s] [%s] ", timestamp, level_str);
-        vfprintf(log_file_ptr, format, args);
-        fprintf(log_file_ptr, "\n");
+        fprintf(log_file_ptr, "[%s] ERROR: %s\nEndpoint: %s\nURL: %s\nCode: %d\n\n",
+                timestamp, error->message, error->endpoint, error->url, error->code);
         fflush(log_file_ptr);
     }
     
-    if ((config.verbose_mode && level >= LOG_INFO) || 
-        (config.debug_mode && level >= LOG_DEBUG)) {
-        fprintf(stderr, "[%s] [%s] ", timestamp, level_str);
-        vfprintf(stderr, format, args);
-        fprintf(stderr, "\n");
+    if (config.debug_mode) {
+        fprintf(stderr, "[%s] ERROR: %s\nEndpoint: %s\nURL: %s\nCode: %d\n",
+                timestamp, error->message, error->endpoint, error->url, error->code);
     }
-    
-    va_end(args);
-    pthread_mutex_unlock(&log_mutex);
 }
 
-char* getCurrentDateTime(void) {
-    char* datetime = malloc(MAX_DATE_LENGTH);
-    if (!datetime) return NULL;
-    
-    time_t now = time(NULL);
-    struct tm tm_info;
-    gmtime_r(&now, &tm_info);
-    
-    strftime(datetime, MAX_DATE_LENGTH - 1, "%Y-%m-%d", &tm_info);
-    return datetime;
-}
-
-bool initializeDateRange(const Endpoint *endpoint, char **beginDate, char **endDate) {
-    time_t now = time(NULL);
-    struct tm tm_now;
-    localtime_r(&now, &tm_now);
-    
-    // Initialize end date
-    *endDate = config.to_date ? strdup(config.to_date) : getCurrentDateTime();
-    if (!*endDate) return false;
-    
-    // Initialize begin date
-    if (config.from_date) {
-        *beginDate = strdup(config.from_date);
-    } else {
-        time_t start = now - (endpoint->default_date_range_days * 24 * 60 * 60);
-        struct tm tm_start;
-        localtime_r(&start, &tm_start);
-        
-        *beginDate = malloc(MAX_DATE_LENGTH);
-        if (*beginDate) {
-            strftime(*beginDate, MAX_DATE_LENGTH, "%Y-%m-%d", &tm_start);
-        }
+void handle_error(ErrorInfo *error) {
+    log_error(error);
+    if (error->code >= 500) {  // Server errors
+        sleep(config.rate_limit * 2);  // Additional delay for server errors
     }
-    
-    if (!*beginDate) {
-        free(*endDate);
-        return false;
-    }
-    
-    return true;
 }
 
-void setError(ErrorInfo *error, const char *message, int code) {
-    if (!error) return;
-    
-    snprintf(error->message, MAX_ERROR_LENGTH, "%s", message);
-    error->code = code;
-}
 
-bool shouldContinueProcessing(const PaginationState *pagination) {
-    return pagination->has_more && 
-           pagination->page_number < config.max_iterations && 
-           !shutdown_requested;
-}
 
-bool shouldAbortRetry(const ErrorInfo *error) {
-    return error->code >= 400 && error->code < 500;  // Client errors
-}
 
-void handleFetchError(ErrorInfo *error, int retryCount) {
-    logMessage(LOG_WARNING, "Fetch attempt %d failed: %s (code: %d)", 
-               retryCount + 1, error->message, error->code);
-    
-    // Exponential backoff for retries
-    sleep((1 << retryCount) * config.rate_limit);
-}
-
-json_object* parseAndValidateResponse(const char *response, 
-                                    const Endpoint *endpoint, 
-                                    ErrorInfo *error) {
-    json_object *parsed_json = json_tokener_parse(response);
-    if (!parsed_json) {
-        setError(error, "Failed to parse JSON response", -1);
-        return NULL;
-    }
-    
-    if (!validateResponseFormat(parsed_json, endpoint)) {
-        setError(error, "Invalid response format", -1);
-        json_object_put(parsed_json);
-        return NULL;
-    }
-    
-    return parsed_json;
-}
-
-bool processResponseData(const Endpoint *endpoint, json_object *parsed_json, 
-                        ProcessingContext *ctx) {
-    json_object *items;
-    if (!json_object_object_get_ex(parsed_json, endpoint->key, &items)) {
-        return false;
-    }
-    
-    int n_items = json_object_array_length(items);
-    if (n_items == 0) {
-        ctx->pagination.has_more = false;
-        return true;
-    }
-    
-    return isJSONFormat() ? 
-           processJSONItems(items, ctx) : 
-           processCSVItems(items, ctx);
-}
-
-bool setupCURLRequest(CURL *curl, const char *url, MemoryStruct *chunk, 
-                     struct curl_slist **headers, ErrorInfo *error) {
-    const char* api_username = getenv("REPSLY_API_USERNAME");
-    const char* api_password = getenv("REPSLY_API_PASSWORD");
-    
-    if (!api_username || !api_password) {
-        setError(error, "API credentials not set", -1);
-        return false;
-    }
-    
-    curl_easy_setopt(curl, CURLOPT_URL, url);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeMemoryCallback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)chunk);
-    curl_easy_setopt(curl, CURLOPT_USERNAME, api_username);
-    curl_easy_setopt(curl, CURLOPT_PASSWORD, api_password);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, config.timeout);
-    
-    *headers = curl_slist_append(NULL, "Content-Type: application/json");
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, *headers);
-    
-    return true;
-}
-
-static size_t writeMemoryCallback(void *contents, size_t size, size_t nmemb, void *userp) {
+static size_t write_memory_callback(void *contents, size_t size, size_t nmemb, void *userp) {
     size_t realsize = size * nmemb;
     MemoryStruct *mem = (MemoryStruct *)userp;
     
     char *ptr = realloc(mem->memory, mem->size + realsize + 1);
     if (!ptr) {
-        logMessage(LOG_ERROR, "Failed to allocate memory (realloc returned NULL)");
+        fprintf(stderr, "Error: Not enough memory (realloc returned NULL)\n");
         return 0;
     }
     
@@ -1653,197 +496,1462 @@ static size_t writeMemoryCallback(void *contents, size_t size, size_t nmemb, voi
     return realsize;
 }
 
-void cleanupProcessingContext(ProcessingContext *ctx, CURL *curl) {
-    if (ctx->output_file) fclose(ctx->output_file);
-    if (ctx->chunk.memory) free(ctx->chunk.memory);
-    if (ctx->begin_date) free(ctx->begin_date);
-    if (ctx->end_date) free(ctx->end_date);
-    if (curl) curl_easy_cleanup(curl);
-    cleanupCSVState(&ctx->csv_state);
+
+
+int fetch_data_with_backoff(const char* url, MemoryStruct* chunk, int attempt, ErrorInfo *error) {
+    if (attempt > 1) {
+        int delay = (int)(pow(2, attempt - 1) * config.rate_limit);
+        delay += rand() % config.rate_limit;  // Add jitter
+        sleep(delay);
+    }
+    
+    return fetch_data(url, chunk, error);
 }
 
-bool isJSONFormat(void) {
-    return strcmp(config.export_format, "json") == 0;
+int fetch_data(const char* url, MemoryStruct* chunk, ErrorInfo *error) {
+    CURLcode res;
+    struct curl_slist *headers = NULL;
+    long response_code = 0;
+    
+    const char* api_username = getenv("REPSLY_API_USERNAME");
+    const char* api_password = getenv("REPSLY_API_PASSWORD");
+    
+    if (!api_username || !api_password) {
+        if (error) {
+            snprintf(error->message, MAX_ERROR_LENGTH, 
+                    "API credentials not set. Please set REPSLY_API_USERNAME and REPSLY_API_PASSWORD environment variables.");
+            error->code = -1;
+        }
+        return -1;
+    }
+    
+    curl_easy_setopt(curl_handle, CURLOPT_URL, url);
+    curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, write_memory_callback);
+    curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, (void *)chunk);
+    curl_easy_setopt(curl_handle, CURLOPT_USERNAME, api_username);
+    curl_easy_setopt(curl_handle, CURLOPT_PASSWORD, api_password);
+    curl_easy_setopt(curl_handle, CURLOPT_TIMEOUT, config.timeout);
+    
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
+    
+    res = curl_easy_perform(curl_handle);
+    
+    curl_slist_free_all(headers);
+    
+    if (res != CURLE_OK) {
+        if (error) {
+            snprintf(error->message, MAX_ERROR_LENGTH, 
+                    "CURL error: %s", curl_easy_strerror(res));
+            error->code = res;
+        }
+        return -1;
+    }
+    
+    curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE, &response_code);
+    
+    if (response_code != 200) {
+        if (error) {
+            snprintf(error->message, MAX_ERROR_LENGTH, 
+                    "HTTP error: %ld", response_code);
+            error->code = response_code;
+        }
+        return -1;
+    }
+    
+    return 0;
 }
 
-void handleCURLError(CURLcode res, ErrorInfo *error) {
-    setError(error, curl_easy_strerror(res), res);
+
+
+void parse_command_line(int argc, char *argv[]) {
+    static struct option long_options[] = {
+        {"debug", no_argument, 0, 'd'},
+        {"raw", no_argument, 0, 'R'},
+        {"verbose", no_argument, 0, 'v'},
+        {"endpoint", required_argument, 0, 'e'},
+        {"output", required_argument, 0, 'o'},
+        {"limit", required_argument, 0, 'l'},
+        {"page-size", required_argument, 0, 'p'},
+        {"from", required_argument, 0, 'f'},
+        {"to", required_argument, 0, 't'},
+        {"retries", required_argument, 0, 'r'},
+        {"timeout", required_argument, 0, 'T'},
+        {"no-cache", no_argument, 0, 'n'},
+        {"update-cache", no_argument, 0, 'u'},
+        {"format", required_argument, 0, 'F'},
+        {"log", required_argument, 0, 'L'},
+        {"help", no_argument, 0, 'h'},
+        {0, 0, 0, 0}
+    };
+
+    int opt;
+    while ((opt = getopt_long(argc, argv, "dRve:o:l:p:f:t:r:T:nuF:L:h", 
+                             long_options, NULL)) != -1) {
+        switch (opt) {
+            case 'd':
+                config.debug_mode = 1;
+                break;
+            case 'R':
+                config.raw_data_mode = 1;
+                break;
+            case 'v':
+                config.verbose_mode = 1;
+                break;
+            case 'e':
+                config.specific_endpoint = strdup(optarg);
+                break;
+            case 'o':
+                config.output_directory = strdup(optarg);
+                break;
+            case 'l':
+                config.rate_limit = atoi(optarg);
+                break;
+            case 'p':
+                config.page_size = atoi(optarg);
+                break;
+            case 'f':
+                config.from_date = strdup(optarg);
+                break;
+            case 't':
+                config.to_date = strdup(optarg);
+                break;
+            case 'r':
+                config.retry_attempts = atoi(optarg);
+                break;
+            case 'T':
+                config.timeout = atoi(optarg);
+                break;
+            case 'n':
+                config.use_cache = 0;
+                break;
+            case 'u':
+                config.update_cache = 1;
+                break;
+            case 'F':
+                config.export_format = strdup(optarg);
+                break;
+            case 'L':
+                config.log_file = strdup(optarg);
+                break;
+            case 'h':
+                print_help();
+                exit(0);
+            default:
+                fprintf(stderr, "Try '%s --help' for more information.\n", argv[0]);
+                exit(1);
+        }
+    }
+    
+    validate_config();
 }
 
-FILE* openOutputFile(const char *filename, ErrorInfo *error) {
-    FILE *file = fopen(filename, isJSONFormat() ? "a" : "w");
-    if (!file) {
-        setError(error, "Failed to open output file", errno);
-    }
-    return file;
-}
-
-
-int main(int argc, char *argv[]) {
-    int result = 0;
-    MonitorData monitor_data = {0};
-    pthread_t monitor_thread;
-    
-    // Setup signal handlers
-    signal(SIGINT, handleSignal);
-    signal(SIGTERM, handleSignal);
-    
-    // Parse command line and initialize
-    parseCommandLine(argc, argv);
-    initializeApplication();
-    
-    // Initialize thread pool
-    ThreadPool pool;
-    if (initializeThreadPool(&pool, MAX_THREADS) != 0) {
-        handleCriticalError("Failed to initialize thread pool", NULL);
+void validate_config(void) {
+    if (config.rate_limit < 0) {
+        fprintf(stderr, "Error: Rate limit must be non-negative\n");
+        exit(1);
     }
     
-    // Start monitoring thread if in debug mode
-    if (config.debug_mode) {
-        monitor_data.pool = &pool;
-        monitor_data.active = true;
-        if (pthread_create(&monitor_thread, NULL, monitorThreadFunction, &monitor_data) != 0) {
-            logMessage(LOG_WARNING, "Failed to create monitoring thread");
-        }
+    if (config.page_size <= 0) {
+        fprintf(stderr, "Error: Page size must be positive\n");
+        exit(1);
     }
     
-    // Create job array
-    int max_jobs = num_endpoints;
-    Job **jobs = calloc(max_jobs, sizeof(Job*));
-    if (!jobs) {
-        handleCriticalError("Failed to allocate memory for jobs", &pool);
+    if (config.retry_attempts < 0) {
+        fprintf(stderr, "Error: Retry attempts must be non-negative\n");
+        exit(1);
     }
     
-    // Create and queue jobs
-    int job_count = 0;
-    for (int i = 0; i < num_endpoints && !shutdown_requested; i++) {
-        // Skip if not the specified endpoint
-        if (config.specific_endpoint && 
-            strcmp(config.specific_endpoint, endpoints[i].name) != 0) {
-            continue;
-        }
-        
-        // Create job
-        Job* job = createJob(&endpoints[i], 
-                           config.output_directory ? config.output_directory : ".");
-        if (!job) {
-            logMessage(LOG_ERROR, "Failed to create job for endpoint: %s", 
-                      endpoints[i].name);
-            continue;
-        }
-        
-        // Store and enqueue job
-        jobs[job_count++] = job;
-        if (!enqueueJob(&pool.job_queue, job)) {
-            logMessage(LOG_ERROR, "Failed to enqueue job for endpoint: %s", 
-                      endpoints[i].name);
-            destroyJob(job);
-            jobs[job_count - 1] = NULL;
-            job_count--;
-        }
+    if (config.timeout <= 0) {
+        fprintf(stderr, "Error: Timeout must be positive\n");
+        exit(1);
     }
     
-    // Process completion loop
-    bool all_complete;
-    do {
-        if (shutdown_requested) {
-            logMessage(LOG_INFO, "Shutdown requested, waiting for active jobs to complete...");
-            break;
-        }
-        
-        all_complete = true;
-        sleep(1);
-        
-        pthread_mutex_lock(&pool.thread_count_mutex);
-        for (int i = 0; i < job_count; i++) {
-            if (jobs[i] && !jobs[i]->completed) {
-                all_complete = false;
+    if (config.export_format && 
+        strcmp(config.export_format, "csv") != 0 && 
+        strcmp(config.export_format, "json") != 0) {
+        fprintf(stderr, "Error: Export format must be 'csv' or 'json'\n");
+        exit(1);
+    }
+    
+    if (config.specific_endpoint) {
+        bool valid_endpoint = false;
+        for (int i = 0; i < num_endpoints; i++) {
+            if (strcmp(config.specific_endpoint, endpoints[i].name) == 0) {
+                valid_endpoint = true;
                 break;
             }
         }
-        pthread_mutex_unlock(&pool.thread_count_mutex);
+        if (!valid_endpoint) {
+            fprintf(stderr, "Error: Invalid endpoint specified\n");
+            exit(1);
+        }
+    }
+}
+
+
+
+
+char* get_current_datetime(void) {
+    time_t now = time(NULL);
+    struct tm *t = gmtime(&now);
+    char *datetime = malloc(MAX_DATE_LENGTH);
+    if (!datetime) {
+        fprintf(stderr, "Error: Failed to allocate memory for datetime\n");
+        return NULL;
+    }
+    strftime(datetime, MAX_DATE_LENGTH - 1, "%Y-%m-%dT%H:%M:%SZ", t);
+    return datetime;
+}
+
+char* convert_date(const char* date_string) {
+    static char buffer[MAX_DATE_LENGTH];
+    long long milliseconds;
+    int timezone_offset;
+    
+    // Handle /Date()/ format
+    if (sscanf(date_string, "/Date(%lld%d)/", &milliseconds, &timezone_offset) == 2) {
+        time_t seconds = milliseconds / 1000;
+        struct tm* tm_info = gmtime(&seconds);
         
-    } while (!all_complete && pool.active_threads > 0);
-    
-    // Stop monitoring thread if active
-    if (config.debug_mode) {
-        monitor_data.active = false;
-        pthread_join(monitor_thread, NULL);
+        strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", tm_info);
+        
+        int hours = abs(timezone_offset) / 100;
+        int minutes = abs(timezone_offset) % 100;
+        snprintf(buffer + strlen(buffer), sizeof(buffer) - strlen(buffer), 
+                " %c%02d:%02d", 
+                timezone_offset >= 0 ? '+' : '-', 
+                hours, 
+                minutes);
+        
+        return buffer;
     }
     
-    // Check for failed jobs
-    for (int i = 0; i < job_count; i++) {
-        if (jobs[i] && jobs[i]->error.code != 0) {
-            logMessage(LOG_ERROR, "Job failed for endpoint %s: %s", 
-                      jobs[i]->endpoint->name, jobs[i]->error.message);
-            result = 1;
+    // Handle ISO 8601 format
+    struct tm tm_info = {0};
+    char *result = strptime(date_string, "%Y-%m-%dT%H:%M:%S", &tm_info);
+    if (result) {
+        strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &tm_info);
+        return buffer;
+    }
+    
+    // Return original string if no conversion needed
+    strncpy(buffer, date_string, sizeof(buffer) - 1);
+    buffer[sizeof(buffer) - 1] = '\0';
+    return buffer;
+}
+
+void split_date_range(const char *start_date, const char *end_date, 
+                     char **current_start, char **current_end) {
+    struct tm start_tm = {0}, end_tm = {0}, current_tm = {0};
+    time_t start_time, end_time, current_time;
+    
+    // Parse start and end dates
+    strptime(start_date, "%Y-%m-%d", &start_tm);
+    strptime(end_date, "%Y-%m-%d", &end_tm);
+    
+    start_time = mktime(&start_tm);
+    end_time = mktime(&end_tm);
+    current_time = start_time;
+    
+    // Allocate memory for date strings
+    *current_start = malloc(MAX_DATE_LENGTH);
+    *current_end = malloc(MAX_DATE_LENGTH);
+    if (!*current_start || !*current_end) {
+        fprintf(stderr, "Error: Failed to allocate memory for date range\n");
+        return;
+    }
+    
+    // Convert current time to tm structure
+    current_tm = *localtime(&current_time);
+    
+    // Format dates
+    strftime(*current_start, MAX_DATE_LENGTH, "%Y-%m-%d", &current_tm);
+    
+    // Add default interval (7 days)
+    current_time += (7 * 24 * 60 * 60);
+    if (current_time > end_time) {
+        current_time = end_time;
+    }
+    
+    current_tm = *localtime(&current_time);
+    strftime(*current_end, MAX_DATE_LENGTH, "%Y-%m-%d", &current_tm);
+}
+
+bool validate_date_format(const char *date) {
+    if (!date) return false;
+    
+    // Check length
+    size_t len = strlen(date);
+    if (len != 10) return false;
+    
+    // Check format (YYYY-MM-DD)
+    if (date[4] != '-' || date[7] != '-') return false;
+    
+    // Parse components
+    int year, month, day;
+    if (sscanf(date, "%d-%d-%d", &year, &month, &day) != 3) return false;
+    
+    // Validate ranges
+    if (year < 1900 || year > 2100) return false;
+    if (month < 1 || month > 12) return false;
+    if (day < 1 || day > 31) return false;
+    
+    return true;
+}
+
+
+void init_rate_limiter(RateLimiter *limiter) {
+    if (!limiter) return;
+    
+    limiter->last_request = 0;
+    limiter->requests_in_window = 0;
+    limiter->window_size = DEFAULT_WINDOW_SIZE;
+    limiter->max_requests = DEFAULT_MAX_REQUESTS;
+    limiter->min_interval = MIN_REQUEST_INTERVAL;
+    limiter->backoff_active = false;
+    limiter->backoff_multiplier = 1;
+}
+
+void apply_rate_limit(RateLimiter *limiter, ErrorInfo *error) {
+    if (!limiter) {
+        if (error) {
+            snprintf(error->message, MAX_ERROR_LENGTH, "Invalid rate limiter");
+            error->code = -1;
+        }
+        return;
+    }
+
+    time_t now = time(NULL);
+    
+    // Check minimum interval between requests
+    double time_since_last = difftime(now, limiter->last_request);
+    if (time_since_last < limiter->min_interval) {
+        double sleep_time = limiter->min_interval - time_since_last;
+        if (sleep_time > 0) {
+            if (config.debug_mode) {
+                log_message("Rate limit: Sleeping for %.2f seconds", sleep_time);
+            }
+            usleep((useconds_t)(sleep_time * 1000000));
+        }
+    }
+
+    // Reset window if needed
+    if (difftime(now, limiter->last_request) >= limiter->window_size) {
+        limiter->requests_in_window = 0;
+        limiter->last_request = now;
+    }
+
+    // Apply rate limiting with exponential backoff if active
+    if (limiter->backoff_active) {
+        double backoff_time = limiter->min_interval * limiter->backoff_multiplier;
+        if (config.debug_mode) {
+            log_message("Applying exponential backoff: %.2f seconds", backoff_time);
+        }
+        sleep((unsigned int)backoff_time);
+    }
+    
+    // Check if we're at the limit
+    if (limiter->requests_in_window >= limiter->max_requests) {
+        double wait_time = limiter->window_size - difftime(now, limiter->last_request);
+        if (wait_time > 0) {
+            if (config.debug_mode) {
+                log_message("Rate limit reached: Waiting %.2f seconds", wait_time);
+            }
+            sleep((unsigned int)wait_time);
+            limiter->requests_in_window = 0;
+            limiter->last_request = time(NULL);
+        }
+    }
+
+    // Update state
+    limiter->requests_in_window++;
+    limiter->last_request = time(NULL);
+}
+
+void handle_rate_limit_response(RateLimiter *limiter, int http_status) {
+    if (!limiter) return;
+
+    switch (http_status) {
+        case 429: // Too Many Requests
+            if (!limiter->backoff_active) {
+                limiter->backoff_active = true;
+                limiter->backoff_multiplier = 1;
+            } else {
+                limiter->backoff_multiplier *= 2;
+                if (limiter->backoff_multiplier > 32) { // Cap the multiplier
+                    limiter->backoff_multiplier = 32;
+                }
+            }
+            
+            if (config.debug_mode) {
+                log_message("Rate limit exceeded. Backing off with multiplier: %d", 
+                           limiter->backoff_multiplier);
+            }
+            break;
+
+        case 200: // Successful request
+            if (limiter->backoff_active) {
+                limiter->backoff_multiplier = limiter->backoff_multiplier > 1 ? 
+                                            limiter->backoff_multiplier / 2 : 1;
+                if (limiter->backoff_multiplier == 1) {
+                    limiter->backoff_active = false;
+                }
+            }
+            break;
+
+        default:
+            // For other errors, implement mild backoff
+            if (!limiter->backoff_active) {
+                limiter->backoff_active = true;
+                limiter->backoff_multiplier = 1;
+            }
+            break;
+    }
+}
+
+void reset_rate_limiter(RateLimiter *limiter) {
+    if (!limiter) return;
+    
+    limiter->requests_in_window = 0;
+    limiter->last_request = time(NULL);
+    limiter->backoff_active = false;
+    limiter->backoff_multiplier = 1;
+}
+
+void adjust_rate_limits(RateLimiter *limiter, int response_time) {
+    if (!limiter) return;
+
+    static double avg_response_time = 0;
+    static int sample_count = 0;
+    const double alpha = 0.1; 
+
+    if (sample_count == 0) {
+        avg_response_time = response_time;
+    } else {
+        avg_response_time = (alpha * response_time) + ((1 - alpha) * avg_response_time);
+    }
+    sample_count++;
+
+    if (avg_response_time > 2000) {
+        limiter->max_requests = (int)(limiter->max_requests * 0.8);
+        if (limiter->max_requests < 10) limiter->max_requests = 10;
+    } else if (avg_response_time < 500 && limiter->max_requests < DEFAULT_MAX_REQUESTS) {
+        limiter->max_requests = (int)(limiter->max_requests * 1.1);
+        if (limiter->max_requests > DEFAULT_MAX_REQUESTS) {
+            limiter->max_requests = DEFAULT_MAX_REQUESTS;
+        }
+    }
+}
+
+
+
+bool validate_response_format(const json_object *parsed_json, const Endpoint *endpoint) {
+    if (!parsed_json || !endpoint) return false;
+    
+    struct json_object *items;
+    if (!json_object_object_get_ex(parsed_json, endpoint->key, &items)) {
+        if (config.debug_mode) {
+            fprintf(stderr, "[%s] Key '%s' not found in response\n", 
+                    endpoint->name, endpoint->key);
+            fprintf(stderr, "Available keys: ");
+            json_object_object_foreach(parsed_json, key, val) {
+                fprintf(stderr, "%s ", key);
+            }
+            fprintf(stderr, "\n");
+        }
+        return false;
+    }
+    
+    if (json_object_get_type(items) != json_type_array) {
+
+        if (config.debug_mode) {
+            fprintf(stderr, "[%s] '%s' is not an array\n", 
+                    endpoint->name, endpoint->key);
+        }
+        return false;
+    }
+    
+    if (endpoint->pagination_type != NONE) {
+        struct json_object *meta;
+        if (!json_object_object_get_ex(parsed_json, "MetaCollectionResult", &meta)) {
+            if (config.debug_mode) {
+                fprintf(stderr, "[%s] MetaCollectionResult not found\n", endpoint->name);
+            }
+            return false;
+        }
+        
+        if (endpoint->pagination_type == TIMESTAMP || 
+            endpoint->pagination_type == ID) {
+            const char *field = endpoint->use_timestamp_pagination ? 
+                              "LastTimeStamp" : "LastID";
+            struct json_object *last_val;
+            if (!json_object_object_get_ex(meta, field, &last_val)) {
+                if (config.debug_mode) {
+                    fprintf(stderr, "[%s] %s not found in metadata\n", 
+                            endpoint->name, field);
+                }
+                return false;
+            }
         }
     }
     
-    // Merge output files if successful and not shutdown
-    if (result == 0 && !shutdown_requested) {
-        if (!mergeFiles(jobs, job_count, 
-                       config.output_directory ? config.output_directory : ".")) {
-            logMessage(LOG_ERROR, "Failed to merge output files");
-            result = 1;
+    return true;
+}
+
+bool is_valid_response(const char *response, const Endpoint *endpoint) {
+    if (!response || !endpoint) return false;
+    
+    struct json_object *parsed_json = json_tokener_parse(response);
+    if (!parsed_json) {
+        if (config.debug_mode) {
+            fprintf(stderr, "[%s] Failed to parse JSON response\n", endpoint->name);
+        }
+        return false;
+    }
+    
+    bool is_valid = validate_response_format(parsed_json, endpoint);
+    json_object_put(parsed_json);
+    return is_valid;
+}
+
+bool update_pagination(const Endpoint *endpoint, json_object *parsed_json, 
+                      char *last_id, size_t last_id_size, int *skip, 
+                      char **begin_date, char **end_date) {
+    if (!endpoint || !parsed_json || !last_id || !skip || !begin_date || !end_date) {
+        return false;
+    }
+
+    struct json_object *meta;
+    if (!json_object_object_get_ex(parsed_json, "MetaCollectionResult", &meta)) {
+        return false;
+    }
+
+    switch (endpoint->pagination_type) {
+        case TIMESTAMP:
+            {
+            struct json_object *last_timestamp_obj;
+            const char *last_timestamp_key = "LastTimeStamp";
+
+            if (!json_object_object_get_ex(meta, last_timestamp_key, &last_timestamp_obj)) {
+                printf("LastTimeStamp not found in MetaCollectionResult.\n");
+                return false;
+            }
+
+            long long new_timestamp = json_object_get_int64(last_timestamp_obj);
+            long long current_timestamp;
+            sscanf(last_id, "%lld", &current_timestamp);
+
+            printf("New Timestamp: %lld, Current Timestamp: %lld\n", new_timestamp, current_timestamp);
+
+            if (new_timestamp <= current_timestamp) {
+                return false;
+            }
+
+            snprintf(last_id, last_id_size, "%lld", new_timestamp);
+            return true;
+            }
+            
+        case ID: {
+            struct json_object *last_id_obj;
+            if (!json_object_object_get_ex(meta, "LastID", &last_id_obj)) {
+                printf("LastID not found in MetaCollectionResult.\n");
+                return false;
+            }
+
+            const char *new_last_id = json_object_get_string(last_id_obj);
+            printf("New Last ID: %s, Current Last ID: %s\n", new_last_id, last_id);
+
+            if (strcmp(new_last_id, last_id) == 0) {
+                return false;
+            }
+
+            strncpy(last_id, new_last_id, last_id_size - 1);
+            last_id[last_id_size - 1] = '\0';
+            return true;
+        }
+
+        case SKIP: {
+            struct json_object *total_obj;
+            if (!json_object_object_get_ex(meta, "TotalCount", &total_obj)) {
+                printf("TotalCount not found in MetaCollectionResult.\n");
+                return false;
+            }
+
+            int total = json_object_get_int(total_obj);
+            *skip += config.page_size;
+
+            printf("Skip: %d, Total: %d\n", *skip, total);
+            return *skip < total;
+        }
+
+        case DATE_RANGE: {
+            time_t current_end_time;
+            struct tm end_tm = {0};
+            if (strptime(*end_date, "%Y-%m-%d", &end_tm) == NULL) {
+                printf("Failed to parse end_date: %s\n", *end_date);
+                return false;
+            }
+            current_end_time = mktime(&end_tm);
+            free(*begin_date);
+            *begin_date = strdup(*end_date);
+
+            current_end_time += (endpoint->default_date_range_days * 24 * 60 * 60);
+
+            time_t final_end_time;
+            struct tm final_end_tm = {0};
+            strptime(config.to_date ? config.to_date : get_current_datetime(), 
+                    "%Y-%m-%d", &final_end_tm);
+            final_end_time = mktime(&final_end_tm);
+
+            printf("Current End Time: %ld, Final End Time: %ld\n", current_end_time, final_end_time);
+
+            if (current_end_time >= final_end_time) {
+                return false;
+            }
+
+            struct tm *new_end_tm = localtime(&current_end_time);
+            char new_end_date[MAX_DATE_LENGTH];
+            strftime(new_end_date, sizeof(new_end_date), "%Y-%m-%d", new_end_tm);
+
+            free(*end_date);
+            *end_date = strdup(new_end_date);
+
+            printf("Updated End Date: %s\n", *end_date);
+            return true;
+        }
+
+        default:
+            return false;
+    }
+}
+
+
+
+
+void process_json_value(FILE *csv_file, struct json_object *val, bool convert_timestamp) {
+    enum json_type type = json_object_get_type(val);
+    switch (type) {
+        case json_type_null:
+            fputs("", csv_file);
+            break;
+            
+        case json_type_boolean:
+            fprintf(csv_file, json_object_get_boolean(val) ? "true" : "false");
+            break;
+            
+        case json_type_double:
+            fprintf(csv_file, "%.6f", json_object_get_double(val));
+            break;
+            
+        case json_type_int:
+            fprintf(csv_file, "%d", json_object_get_int(val));
+            break;
+            
+        case json_type_string: {
+            const char *str = json_object_get_string(val);
+            if (convert_timestamp && strstr(str, "/Date(") == str) {
+                fprintf(csv_file, "%s", convert_date(str));
+            } else if (strchr(str, ',') != NULL || strchr(str, '"') != NULL) {
+                fprintf(csv_file, "\"%s\"", str);
+            } else {
+                fprintf(csv_file, "%s", str);
+            }
+            break;
+        }
+            
+        case json_type_array:
+        case json_type_object:
+            {
+                const char *json_str = json_object_to_json_string(val);
+                fprintf(csv_file, "\"%s\"", json_str);
+            }
+            break;
+    }
+}
+
+bool is_duplicate_record(json_object *item, const char *last_id, bool use_timestamp) {
+    struct json_object *id_obj;
+    const char *id_field = use_timestamp ? "TimeStamp" : "ID";
+    
+    if (!json_object_object_get_ex(item, id_field, &id_obj)) {
+        return false;
+    }
+    
+    if (use_timestamp) {
+        long long item_timestamp = json_object_get_int64(id_obj);
+        long long last_timestamp;
+        sscanf(last_id, "%lld", &last_timestamp);
+        return item_timestamp <= last_timestamp;
+    } else {
+        const char *item_id = json_object_get_string(id_obj);
+        return strcmp(item_id, last_id) <= 0;
+    }
+}
+
+
+
+
+
+void write_csv_header(FILE *csv_file, json_object *items, CSVState *csv_state) {
+    if (!csv_file || !items || !csv_state) return;
+    
+    csv_state->headers = NULL;
+    csv_state->header_count = 0;
+    
+    int array_len = json_object_array_length(items);
+    if (array_len == 0) return;
+    
+    for (int i = 0; i < array_len; i++) {
+        json_object *item = json_object_array_get_idx(items, i);
+        json_object_object_foreach(item, key, val) {
+            bool found = false;
+            for (int j = 0; j < csv_state->header_count; j++) {
+                if (strcmp(csv_state->headers[j], key) == 0) {
+                    found = true;
+                    break;
+                }
+            }
+            
+            if (!found) {
+                csv_state->header_count++;
+                csv_state->headers = realloc(csv_state->headers, 
+                    csv_state->header_count * sizeof(char*));
+                if (!csv_state->headers) {
+                    fprintf(stderr, "Error: Memory allocation failed for headers\n");
+                    return;
+                }
+                csv_state->headers[csv_state->header_count - 1] = strdup(key);
+            }
         }
     }
     
-    // Final statistics
-    if (config.verbose_mode || config.debug_mode) {
-        printFinalStats(jobs, job_count);
+    for (int i = 0; i < csv_state->header_count - 1; i++) {
+        for (int j = i + 1; j < csv_state->header_count; j++) {
+            if (strcmp(csv_state->headers[i], csv_state->headers[j]) > 0) {
+                char *temp = csv_state->headers[i];
+                csv_state->headers[i] = csv_state->headers[j];
+                csv_state->headers[j] = temp;
+            }
+        }
     }
     
-    // Cleanup
-    cleanupJobs(jobs, job_count, shutdown_requested);
-    cleanupThreadPool(&pool);
-    cleanupApplication();
+    csv_state->last_row_values = calloc(csv_state->header_count * MAX_BUFFER, 
+                                      sizeof(char));
+    if (!csv_state->last_row_values) {
+        fprintf(stderr, "Error: Memory allocation failed for row values\n");
+        return;
+    }
+    csv_state->last_row_size = csv_state->header_count * MAX_BUFFER;
     
-    #ifdef DEBUG
-    checkMemoryLeaks();
-    #endif
+    for (int i = 0; i < csv_state->header_count; i++) {
+        if (i > 0) fprintf(csv_file, ",");
+        
+        if (strchr(csv_state->headers[i], ',') || strchr(csv_state->headers[i], '"')) {
+            fprintf(csv_file, "\"%s\"", csv_state->headers[i]);
+        } else {
+            fprintf(csv_file, "%s", csv_state->headers[i]);
+        }
+    }
+    fprintf(csv_file, "\n");
+    fflush(csv_file);
+}
+
+void write_csv_row(FILE *csv_file, json_object *item, bool convert_timestamp, 
+                  CSVState *csv_state) {
+    if (!csv_file || !item || !csv_state) return;
     
-    logMessage(LOG_INFO, "Application %s. Processed %d endpoints.", 
-               result == 0 ? "completed successfully" : "completed with errors",
-               job_count);
+    memset(csv_state->last_row_values, 0, csv_state->last_row_size);
     
+    for (int i = 0; i < csv_state->header_count; i++) {
+        if (i > 0) fprintf(csv_file, ",");
+        
+        struct json_object *val = NULL;
+        if (json_object_object_get_ex(item, csv_state->headers[i], &val)) {
+            char buffer[MAX_BUFFER] = {0};
+            FILE *temp = fmemopen(buffer, sizeof(buffer), "w");
+            if (temp) {
+                process_json_value(temp, val, convert_timestamp);
+                fclose(temp);
+
+                // Use snprintf to ensure null-termination
+                snprintf(csv_state->last_row_values + (i * MAX_BUFFER), MAX_BUFFER, "%s", buffer);
+
+                fprintf(csv_file, "%s", buffer);
+            }
+        }
+    }
+    
+    fprintf(csv_file, "\n");
+    fflush(csv_file);
+}
+
+void escape_csv_string(const char *input, char *output, size_t output_size) {
+    if (!input || !output || output_size == 0) return;
+    
+    bool needs_quotes = false;
+    const char *p = input;
+    size_t out_pos = 0;
+    
+    if (strchr(input, ',') || strchr(input, '"') || strchr(input, '\n') || 
+        strchr(input, '\r')) {
+        needs_quotes = true;
+    }
+    
+    if (needs_quotes && out_pos < output_size - 1) {
+        output[out_pos++] = '"';
+    }
+    
+    while (*p && out_pos < output_size - 2) {  // -2 for closing quote and null terminator
+        if (*p == '"') {
+            if (out_pos < output_size - 3) {  // Need space for two quotes
+                output[out_pos++] = '"';
+                output[out_pos++] = '"';
+            } else {
+                break;
+            }
+        } else {
+            output[out_pos++] = *p;
+        }
+        p++;
+    }
+    
+    if (needs_quotes && out_pos < output_size - 1) {
+        output[out_pos++] = '"';
+    }
+    
+    output[out_pos] = '\0';
+}
+
+void cleanup_csv_state(CSVState *csv_state) {
+    if (!csv_state) return;
+    
+    if (csv_state->headers) {
+        for (int i = 0; i < csv_state->header_count; i++) {
+            free(csv_state->headers[i]);
+        }
+        free(csv_state->headers);
+        csv_state->headers = NULL;
+    }
+    
+    if (csv_state->last_row_values) {
+        free(csv_state->last_row_values);
+        csv_state->last_row_values = NULL;
+    }
+    
+    csv_state->header_count = 0;
+    csv_state->last_row_size = 0;
+}
+
+bool validate_csv_file(const char *filename) {
+    FILE *file = fopen(filename, "r");
+    if (!file) return false;
+    
+    char line[MAX_BUFFER];
+    int line_count = 0;
+    int field_count = -1;
+    bool is_valid = true;
+    
+    while (fgets(line, sizeof(line), file) && line_count < 10) {
+        line[strcspn(line, "\n")] = 0;
+        
+        int current_fields = 1;  // Start with 1 for the first field
+        bool in_quotes = false;
+        
+        for (char *p = line; *p; p++) {
+            if (*p == '"') {
+                in_quotes = !in_quotes;
+            } else if (*p == ',' && !in_quotes) {
+                current_fields++;
+            }
+        }
+        
+        if (field_count == -1) {
+            field_count = current_fields;
+        } else if (field_count != current_fields) {
+            is_valid = false;
+            break;
+        }
+        
+        line_count++;
+    }
+    
+    fclose(file);
+    return is_valid && line_count > 0;
+}
+
+void merge_csv_files(const char *input_file, const char *output_file, bool append) {
+    FILE *in = fopen(input_file, "r");
+    if (!in) return;
+    
+    FILE *out = fopen(output_file, append ? "a" : "w");
+    if (!out) {
+        fclose(in);
+        return;
+    }
+    
+    char line[MAX_BUFFER];
+    bool is_header = true;
+    
+    while (fgets(line, sizeof(line), in)) {
+        if (is_header && append) {
+            is_header = false;
+            continue;  // Skip header when appending
+        }
+        fputs(line, out);
+    }
+    
+    fclose(in);
+    fclose(out);
+}
+
+
+int process_endpoint(const Endpoint *endpoint) {
+    if (!endpoint) return -1;
+
+    // Initialize all variables at start
+    char url[MAX_URL_LENGTH] = {0};
+    MemoryStruct chunk = {0};
+    char last_id[64] = "0";
+    char filename[MAX_URL_LENGTH] = {0};
+    char cache_filename[MAX_URL_LENGTH] = {0};
+    PaginationState pagination = {0};
+    int skip = 0;
+    char *begin_date = NULL;
+    char *end_date = NULL;
+    FILE *output_file = NULL;
+    int result = -1;
+    CSVState csv_state = {0};
+    ErrorInfo error = {0};
+    bool first_batch = true;
+    time_t now = time(NULL);
+
+    // Initialize begin_date
+    if (config.from_date) {
+        begin_date = strdup(config.from_date);
+    } else {
+        time_t start = now - (endpoint->default_date_range_days * 24 * 60 * 60);
+        struct tm *tm_start = localtime(&start);
+        begin_date = malloc(MAX_DATE_LENGTH);
+        if (begin_date) {
+            strftime(begin_date, MAX_DATE_LENGTH, "%Y-%m-%d", tm_start);
+        }
+    }
+
+    // Initialize end_date
+    if (config.to_date) {
+        end_date = strdup(config.to_date);
+    } else {
+        end_date = malloc(MAX_DATE_LENGTH);
+        if (end_date) {
+            struct tm *tm_now = localtime(&now);
+            strftime(end_date, MAX_DATE_LENGTH, "%Y-%m-%d", tm_now);
+        }
+    }
+
+    // Validate dates
+    if (!begin_date || !end_date) {
+        log_message("[%s] Failed to initialize dates", endpoint->name);
+        goto cleanup;
+    }
+
+    // Initialize memory chunk
+    chunk.memory = malloc(1);
+    if (!chunk.memory) {
+        log_message("[%s] Failed to allocate initial memory", endpoint->name);
+        goto cleanup;
+    }
+    chunk.size = 0;
+
+    // Setup filenames
+    if (config.output_directory) {
+        snprintf(filename, sizeof(filename), "%s/Repsly_%s_Export.%s", 
+                config.output_directory, endpoint->key, config.export_format);
+        snprintf(cache_filename, sizeof(cache_filename), "%s/Repsly_%s_cache.txt", 
+                config.output_directory, endpoint->key);
+    } else {
+        snprintf(filename, sizeof(filename), "Repsly_%s_Export.%s", 
+                endpoint->key, config.export_format);
+        snprintf(cache_filename, sizeof(cache_filename), "Repsly_%s_cache.txt", 
+                endpoint->key);
+    }
+
+    // Load cache if needed
+    if (endpoint->pagination_type != NONE && config.use_cache) {
+        if (!load_cache(cache_filename, last_id, sizeof(last_id))) {
+            if (endpoint->pagination_type == TIMESTAMP) {
+                strcpy(last_id, "0");
+            }
+        }
+    }
+
+    // Open output file
+    output_file = fopen(filename, strcmp(config.export_format, "csv") == 0 ? "w" : "a");
+    if (!output_file) {
+        log_message("[%s] Failed to open output file %s", endpoint->name, filename);
+        goto cleanup;
+    }
+
+    // Write JSON header if needed
+    if (strcmp(config.export_format, "json") == 0) {
+        fprintf(output_file, "{\n\"%s\": [\n", endpoint->key);
+    }
+
+    // Visit realizations are special ... 
+    if (strcmp(endpoint->name, "visitrealizations") == 0) {
+        time_t past = time(NULL) - (endpoint->default_date_range_days * 24 * 60 * 60);
+        struct tm *tm_past = gmtime(&past);
+        strftime(last_id, sizeof(last_id), "%Y-%m-%dT%H:%M:%S.000Z", tm_past);
+    }
+    // Initialize pagination
+    pagination.page_number = 1;
+    pagination.has_more = true;
+    pagination.records_processed = 0;
+
+    // Main processing loop
+    while (pagination.has_more && pagination.page_number < config.max_iterations) {
+        // Construct URL for current request
+        construct_url(url, sizeof(url), endpoint, last_id, skip, begin_date, end_date, &error);
+        if (error.code != 0) {
+            handle_error(&error);
+            break;
+        }
+
+        // Debug logging
+        if (config.verbose_mode) {
+            log_message("[%s] Requesting page %d (processed %d records)", 
+                       endpoint->name, pagination.page_number, pagination.records_processed);
+            if (config.debug_mode) {
+                log_message("URL: %s", url);
+            }
+        }
+
+        // Fetch data with retries
+        bool fetch_success = false;
+        for (int retry = 0; retry < config.retry_attempts; retry++) {
+            if (fetch_data_with_backoff(url, &chunk, retry + 1, &error) == 0) {
+                fetch_success = true;
+                break;
+            }
+            handle_error(&error);
+            if (error.code >= 400 && error.code < 500) break;
+        }
+
+        if (config.verbose_mode || config.debug_mode) {
+            printf("Response: %s\n", chunk.memory);
+            printf("HTTP Status Code: ");
+            long response_code;
+            curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE, &response_code);
+            printf("%ld\n", response_code);
+        }
+
+        if (!fetch_success) {
+            log_message("[%s] Failed to fetch data after %d attempts", 
+                       endpoint->name, config.retry_attempts);
+            break;
+        }
+
+        // Handle raw data mode
+        if (config.raw_data_mode) {
+            printf("[%s] Raw response:\n%s\n", endpoint->name, chunk.memory);
+            result = 0;
+            break;
+        }
+
+        // Parse response
+        struct json_object *parsed_json = json_tokener_parse(chunk.memory);
+        if (!parsed_json || !validate_response_format(parsed_json, endpoint)) {
+            log_message("[%s] Invalid JSON response", endpoint->name);
+            if (parsed_json) json_object_put(parsed_json);
+            break;
+        }
+
+        // Process items
+        struct json_object *items;
+        json_object_object_get_ex(parsed_json, endpoint->key, &items);
+        int n_items = json_object_array_length(items);
+
+        if (config.verbose_mode) {
+            log_message("[%s] Received %d records", endpoint->name, n_items);
+        }
+
+        if (n_items == 0) {
+            json_object_put(parsed_json);
+            result = 0;
+            break;
+        }
+
+        // Process based on format
+        if (strcmp(config.export_format, "csv") == 0) {
+            if (first_batch) {
+                write_csv_header(output_file, items, &csv_state);
+                first_batch = false;
+            }
+            
+            for (int i = 0; i < n_items; i++) {
+                struct json_object *item = json_object_array_get_idx(items, i);
+                if (!is_duplicate_record(item, last_id, endpoint->use_timestamp_pagination)) {
+                    write_csv_row(output_file, item, !endpoint->use_raw_timestamp, &csv_state);
+                    pagination.records_processed++;
+                }
+            }
+        } else if (strcmp(config.export_format, "json") == 0) {
+            for (int i = 0; i < n_items; i++) {
+                if (!first_batch || i > 0) {
+                    fprintf(output_file, ",\n");
+                }
+                fprintf(output_file, "%s", 
+                        json_object_to_json_string_ext(
+                            json_object_array_get_idx(items, i), 
+                            JSON_C_TO_STRING_PRETTY));
+                first_batch = false;
+                pagination.records_processed++;
+            }
+        }
+
+        // Update pagination state
+        if (!update_pagination(endpoint, parsed_json, last_id, sizeof(last_id), 
+                             &skip, &begin_date, &end_date)) {
+            pagination.has_more = false;
+        }
+
+        json_object_put(parsed_json);
+
+        // Reset chunk for next iteration
+        free(chunk.memory);
+        chunk.memory = malloc(1);
+        if (!chunk.memory) {
+            log_message("[%s] Failed to allocate memory for chunk", endpoint->name);
+            break;
+        }
+        chunk.size = 0;
+
+        pagination.page_number++;
+    }
+
+    // Handle max iterations reached
+    if (pagination.page_number >= config.max_iterations) {
+        log_message("[%s] Reached maximum iteration limit (%d)", 
+                   endpoint->name, config.max_iterations);
+    }
+
+    // Final logging
+    if (config.verbose_mode) {
+        log_message("\n[%s] Complete - Processed %d records in %d pages\n",
+                   endpoint->name, pagination.records_processed, pagination.page_number);
+    }
+
+    // Update cache if needed
+    if (endpoint->pagination_type != NONE && config.use_cache && config.update_cache) {
+        save_cache(cache_filename, last_id);
+    }
+
+    // Write JSON footer if needed
+    if (strcmp(config.export_format, "json") == 0) {
+        fprintf(output_file, "\n]\n}");
+    }
+
+    result = 0;
+
+cleanup:
+    if (output_file) fclose(output_file);
+    if (chunk.memory) free(chunk.memory);
+    if (begin_date) free(begin_date);
+    if (end_date) free(end_date);
+    cleanup_csv_state(&csv_state);
+
     return result;
 }
 
-void printFinalStats(Job **jobs, int job_count) {
-    int completed = 0;
-    int failed = 0;
-    int records = 0;
-    
-    for (int i = 0; i < job_count; i++) {
-        if (!jobs[i]) continue;
-        
-        if (jobs[i]->completed) {
-            completed++;
-            records += jobs[i]->records_processed;
-        } else {
-            failed++;
+void construct_url(char *url, size_t url_size, const Endpoint *endpoint, 
+                  const char *last_id, int skip, const char *begin_date, 
+                  const char *end_date, ErrorInfo *error) {
+    if (!url || !endpoint || url_size == 0) {
+        if (error) {
+            snprintf(error->message, MAX_ERROR_LENGTH, "Invalid parameters for URL construction");
+            error->code = -1;
         }
+        return;
     }
-    
-    logMessage(LOG_INFO, "\nFinal Statistics:");
-    logMessage(LOG_INFO, "----------------");
-    logMessage(LOG_INFO, "Total Jobs: %d", job_count);
-    logMessage(LOG_INFO, "Completed: %d", completed);
-    logMessage(LOG_INFO, "Failed: %d", failed);
-    logMessage(LOG_INFO, "Total Records Processed: %d", records);
-    logMessage(LOG_INFO, "----------------\n");
+
+    // Clear URL buffer
+    memset(url, 0, url_size);
+
+    // Validate parameters based on pagination type
+    switch (endpoint->pagination_type) {
+        case NONE:
+            // No validation needed for NONE type
+            break;
+        case SKIP:
+        if (skip < 0) {
+            if (error) {
+                snprintf(error->message, MAX_ERROR_LENGTH,
+                        "[%s] Invalid skip value: %d",
+                        endpoint->name, skip);
+                error->code = -1;
+            }
+            return;
+        }
+        break;
+        case DATE_RANGE:
+            if (!begin_date || !end_date) {
+                if (error) {
+                    snprintf(error->message, MAX_ERROR_LENGTH, 
+                            "[%s] Missing date parameters for date-range pagination", 
+                            endpoint->name);
+                    error->code = -1;
+                }
+                return;
+            }
+            if (!validate_date_format(begin_date) || !validate_date_format(end_date)) {
+                if (error) {
+                    snprintf(error->message, MAX_ERROR_LENGTH, 
+                            "[%s] Invalid date format (required: YYYY-MM-DD)", 
+                            endpoint->name);
+                    error->code = -1;
+                }
+                return;
+            }
+            break;
+
+        case TIMESTAMP:
+        case ID:
+            if (!last_id) {
+                if (error) {
+                    snprintf(error->message, MAX_ERROR_LENGTH, 
+                            "[%s] Missing ID/timestamp parameter", 
+                            endpoint->name);
+                    error->code = -1;
+                }
+                return;
+            }
+            break;
+    }
+
+    // Construct base URL
+    size_t written = 0;
+    switch (endpoint->pagination_type) {
+        case NONE:
+            written = snprintf(url, url_size, "%s", endpoint->url_format);
+            break;
+
+        case TIMESTAMP:
+        case ID:
+            written = snprintf(url, url_size, endpoint->url_format, last_id);
+            break;
+
+        case SKIP:
+            written = snprintf(url, url_size, endpoint->url_format, last_id, skip);
+            break;
+
+        case DATE_RANGE:
+            written = snprintf(url, url_size, endpoint->url_format, begin_date, end_date);
+            break;
+        default:
+        if (error) {
+            snprintf(error->message, MAX_ERROR_LENGTH, 
+                    "[%s] Invalid pagination type", 
+                    endpoint->name);
+            error->code = -1;
+        }
+        return;
+    }
+
+    if (written >= url_size) {
+        if (error) {
+            snprintf(error->message, MAX_ERROR_LENGTH, 
+                    "[%s] URL buffer too small", 
+                    endpoint->name);
+            error->code = -1;
+        }
+        return;
+    }
+
+    // Add required parameters
+    add_query_parameters(url, url_size, endpoint);
+
+    if (config.debug_mode) {
+        log_message("[%s] Constructed URL: %s", endpoint->name, url);
+    }
 }
 
-void cleanupJobs(Job **jobs, int job_count, bool was_shutdown) {
-    for (int i = 0; i < job_count; i++) {
-        if (jobs[i]) {
-            if (was_shutdown && !jobs[i]->completed) {
-                logMessage(LOG_WARNING, "Job for endpoint %s was interrupted", 
-                          jobs[i]->endpoint->name);
-            }
-            destroyJob(jobs[i]);
+void cleanup_resources(char *begin_date, char *end_date, MemoryStruct *chunk, 
+                      FILE *output_file, CSVState *csv_state) {
+    free(begin_date);
+    free(end_date);
+    if (chunk && chunk->memory) free(chunk->memory);
+    if (output_file) fclose(output_file);
+    if (csv_state) cleanup_csv_state(csv_state);
+}
+
+void add_query_parameters(char *url, size_t url_size, const Endpoint *endpoint) {
+    if (!url || !endpoint) return;
+    
+    // Calculate remaining space
+    size_t current_len = strlen(url);
+    size_t remaining = url_size - current_len;
+    if (remaining <= 1) return;  // No space left
+
+    char *separator = strchr(url, '?') ? "&" : "?";
+    
+    // Track space used
+    size_t space_needed = 0;
+    
+    // Check space needed for required parameters
+    if (endpoint->required_parameters) {
+        space_needed = strlen(separator) + strlen(endpoint->required_parameters);
+        if (space_needed < remaining) {
+            snprintf(url + current_len, remaining, "%s%s", 
+                    separator, endpoint->required_parameters);
+            current_len += space_needed;
+            remaining -= space_needed;
+            separator = "&";
         }
     }
-    free(jobs);
+
+    // Check space for include_inactive
+    if (endpoint->include_inactive && remaining > strlen(separator) + 18) {
+        snprintf(url + current_len, remaining, "%sincludeInactive=true", separator);
+        current_len = strlen(url);
+        remaining = url_size - current_len;
+        separator = "&";
+    }
+
+    // Check space for include_deleted
+    if (endpoint->include_deleted && remaining > strlen(separator) + 17) {
+        snprintf(url + current_len, remaining, "%sincludeDeleted=true", separator);
+    }
+}
+
+bool load_cache(const char *cache_filename, char *last_id, size_t last_id_size) {
+    if (!cache_filename || !last_id) return false;
+    
+    FILE *cache_file = fopen(cache_filename, "r");
+    if (!cache_file) {
+        if (config.debug_mode) {
+            log_message("No cache found at %s", cache_filename);
+        }
+        return false;
+    }
+    
+    if (fgets(last_id, last_id_size, cache_file) == NULL) {
+        if (config.debug_mode) {
+            log_message("Error reading from cache file %s", cache_filename);
+        }
+        fclose(cache_file);
+        return false;
+    }
+    
+    last_id[strcspn(last_id, "\n")] = 0;
+    
+    if (config.debug_mode) {
+        log_message("Loaded cache value: %s", last_id);
+    }
+    
+    fclose(cache_file);
+    return true;
+}
+
+void save_cache(const char *cache_filename, const char *last_id) {
+    if (!cache_filename || !last_id) return;
+    
+    FILE *cache_file = fopen(cache_filename, "w");
+    if (!cache_file) {
+        log_message("Error: Unable to save cache file %s", cache_filename);
+        return;
+    }
+    
+    fprintf(cache_file, "%s", last_id);
+    fclose(cache_file);
+    
+    if (config.debug_mode) {
+        log_message("Saved cache value: %s", last_id);
+    }
+}
+
+void log_message(const char *format, ...) {
+    if (!format) return;
+    
+    time_t now = time(NULL);
+    char timestamp[26];
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", localtime(&now));
+    
+    va_list args;
+    va_start(args, format);
+    
+    if (log_file_ptr) {
+        fprintf(log_file_ptr, "[%s] ", timestamp);
+        vfprintf(log_file_ptr, format, args);
+        fprintf(log_file_ptr, "\n");
+        fflush(log_file_ptr);
+    }
+    
+    if (config.verbose_mode || config.debug_mode) {
+        fprintf(stderr, "[%s] ", timestamp);
+        vfprintf(stderr, format, args);
+        fprintf(stderr, "\n");
+    }
+    
+    va_end(args);
+}
+
+void print_help(void) {
+    printf("Usage: repsly2csv [OPTIONS]\n");
+    printf("Options:\n");
+    printf("  -d, --debug             Enable debug mode\n");
+    printf("  -R, --raw               Output raw JSON data\n");
+    printf("  -v, --verbose           Enable verbose output\n");
+    printf("  -e, --endpoint ENDPOINT Specify a single endpoint to process\n");
+    printf("  -o, --output DIR        Specify output directory\n");
+    printf("  -l, --limit SECONDS     Set rate limit in seconds (default: 1)\n");
+    printf("  -p, --page-size SIZE    Set page size for requests (default: 50)\n");
+    printf("  -f, --from DATE         Start date for data retrieval\n");
+    printf("  -t, --to DATE           End date for data retrieval\n");
+    printf("  -r, --retries NUM       Number of retry attempts (default: 3)\n");
+    printf("  -T, --timeout SECONDS   Request timeout in seconds (default: 30)\n");
+    printf("  -n, --no-cache          Disable caching\n");
+    printf("  -u, --update-cache      Force cache update\n");
+    printf("  -F, --format FORMAT     Export format (csv, json) (default: csv)\n");
+    printf("  -L, --log FILE          Specify log file\n");
+    printf("  -h, --help              Display this help message\n");
+}
+
+int main(int argc, char *argv[]) {
+    int result = 0;
+    
+    config.rate_limit = DEFAULT_RATE_LIMIT_SECONDS;
+    config.page_size = DEFAULT_PAGE_SIZE;
+    config.retry_attempts = DEFAULT_RETRY_ATTEMPTS;
+    config.timeout = DEFAULT_TIMEOUT;
+    config.use_cache = 1;
+    config.export_format = "csv";
+    config.max_iterations = DEFAULT_MAX_ITERATIONS;
+    config.debug_mode = 0;
+    config.raw_data_mode = 0;
+    config.verbose_mode = 0;
+    config.specific_endpoint = NULL;
+    config.output_directory = NULL;
+    config.from_date = NULL;
+    config.to_date = NULL;
+    config.update_cache = 0;
+    config.log_file = NULL;
+    
+    parse_command_line(argc, argv);
+    initialize_app();
+    
+    for (int i = 0; i < num_endpoints; i++) {
+        if (config.specific_endpoint && 
+            strcmp(config.specific_endpoint, endpoints[i].name) != 0) {
+            continue; 
+        }
+        
+        if (process_endpoint(&endpoints[i]) != 0) {
+            log_message("Error processing endpoint: %s", endpoints[i].name);
+            result = 1;
+        }
+    }
+    
+    cleanup_app();
+    
+    return result;
 }
