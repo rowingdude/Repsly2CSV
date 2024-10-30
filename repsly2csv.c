@@ -900,13 +900,22 @@ void reset_rate_limiter(RateLimiter *limiter) {
 void adjust_rate_limits(RateLimiter *limiter, int response_time) {
     if (!limiter) return;
 
-    if (response_time > 2000) { // If response takes more than 2 seconds
-        limiter->max_requests = (int)(limiter->max_requests * 0.8); // Reduce by 20%
-        if (limiter->max_requests < 10) { // Don't go too low
-            limiter->max_requests = 10;
-        }
-    } else if (response_time < 500 && limiter->max_requests < DEFAULT_MAX_REQUESTS) {
-        limiter->max_requests = (int)(limiter->max_requests * 1.1); // Increase by 10%
+    static double avg_response_time = 0;
+    static int sample_count = 0;
+    const double alpha = 0.1; 
+
+    if (sample_count == 0) {
+        avg_response_time = response_time;
+    } else {
+        avg_response_time = (alpha * response_time) + ((1 - alpha) * avg_response_time);
+    }
+    sample_count++;
+
+    if (avg_response_time > 2000) {
+        limiter->max_requests = (int)(limiter->max_requests * 0.8);
+        if (limiter->max_requests < 10) limiter->max_requests = 10;
+    } else if (avg_response_time < 500 && limiter->max_requests < DEFAULT_MAX_REQUESTS) {
+        limiter->max_requests = (int)(limiter->max_requests * 1.1);
         if (limiter->max_requests > DEFAULT_MAX_REQUESTS) {
             limiter->max_requests = DEFAULT_MAX_REQUESTS;
         }
