@@ -29,6 +29,8 @@
 #define DEFAULT_WINDOW_SIZE 60  
 #define DEFAULT_MAX_REQUESTS 60 
 #define MIN_REQUEST_INTERVAL 1  
+#define MAX_THREADS 6
+#define MAX_QUEUE_SIZE 12 
 
 /* Configuration Structure */
 typedef struct {
@@ -114,6 +116,48 @@ typedef struct {
     bool backoff_active;       
     int backoff_multiplier;    
 } RateLimiter;
+
+typedef struct {
+    Endpoint* endpoint;
+    char* output_directory;
+    bool completed;
+    ErrorInfo error;
+    char* temp_filename;
+} Job;
+
+typedef struct {
+    Job* jobs[MAX_QUEUE_SIZE];
+    int front;
+    int rear;
+    int size;
+    pthread_mutex_t mutex;
+    pthread_cond_t not_empty;
+    pthread_cond_t not_full;
+} JobQueue;
+
+typedef struct {
+    pthread_t threads[MAX_THREADS];
+    JobQueue job_queue;
+    ThreadSafeRateLimiter* rate_limiter;
+    bool shutdown;
+    int active_threads;
+    pthread_mutex_t thread_count_mutex;
+} ThreadPool;
+
+typedef struct {
+    pthread_mutex_t mutex;
+    pthread_cond_t rate_limit_cv;
+    time_t last_request;
+    int requests_in_window;
+    int window_size;
+    int max_requests;
+    double min_interval;
+    bool backoff_active;
+    int backoff_multiplier;
+    double avg_response_time;
+    int active_requests;
+    int total_requests;
+} ThreadSafeRateLimiter;
 
 /* Globals */
 CURL *curl_handle;
