@@ -32,6 +32,8 @@
 #define MAX_THREADS 6
 #define MAX_QUEUE_SIZE 12 
 
+volatile sig_atomic_t shutdown_requested = 0;
+
 /* Configuration Structure */
 typedef struct {
     int debug_mode;
@@ -166,6 +168,10 @@ typedef struct {
     const char *format;
 } FileMergeTask;
 
+typedef struct {
+    ThreadPool *pool;
+    bool active;
+} MonitorData;
 
 /* Globals */
 CURL *curl_handle;
@@ -606,6 +612,62 @@ void cleanup_thread_pool(ThreadPool* pool) {
     pthread_mutex_destroy(&pool->thread_count_mutex);
 }
 
+void cleanup_thread_pool_resources(ThreadPool *pool) {
+    if (!pool) return;
+    
+    pool->shutdown = true;
+    
+    pthread_mutex_lock(&pool->job_queue.mutex);
+    pthread_cond_broadcast(&pool->job_queue.not_empty);
+    pthread_cond_broadcast(&pool->job_queue.not_full);
+    pthread_mutex_unlock(&pool->job_queue.mutex);
+    
+    for (int i = 0; i < MAX_THREADS; i++) {
+        pthread_join(pool->threads[i], NULL);
+    }
+    
+    while (pool->job_queue.size > 0) {
+        Job *job = dequeue_job(&pool->job_queue);
+        if (job) {
+            destroy_job(job);
+        }
+    }
+    
+    pthread_mutex_destroy(&pool->thread_count_mutex);
+    cleanup_job_queue(&pool->job_queue);
+    
+    if (pool->rate_limiter) {
+        cleanup_thread_safe_rate_limiter(pool->rate_limiter);
+        free(pool->rate_limiter);
+    }
+}
+
+void enhanced_cleanup_app(void) {
+    if (curl_handle) {
+        curl_easy_cleanup(curl_handle);
+        curl_handle = NULL;
+    }
+    curl_global_cleanup();
+    
+    if (log_file_ptr) {
+        fclose(log_file_ptr);
+        log_file_ptr = NULL;
+    }
+    
+    pthread_mutex_destroy(&log_mutex);
+    pthread_mutex_destroy(&curl_mutex);
+    
+    free(config.specific_endpoint);
+    free(config.output_directory);
+    free(config.from_date);
+    free(config.to_date);
+    if (config.export_format && strcmp(config.export_format, "csv") != 0) {
+        free(config.export_format);
+    }
+    free(config.log_file);
+}
+
+
 void initialize_app(void) {
     config.rate_limit = DEFAULT_RATE_LIMIT_SECONDS;
     config.page_size = DEFAULT_PAGE_SIZE;
@@ -629,6 +691,16 @@ void initialize_app(void) {
                     config.log_file, strerror(errno));
         }
     }
+}
+
+void handle_critical_error(const char *message, ThreadPool *pool) {
+    log_message_threaded("CRITICAL ERROR: %s", message);
+    
+    if (pool) {
+        cleanup_thread_pool_resources(pool);
+    }
+    enhanced_cleanup_app();
+    exit(1);
 }
 
 void cleanup_app(void) {
@@ -948,79 +1020,75 @@ void init_rate_limiter(RateLimiter *limiter) {
 }
 
 
-void apply_rate_limit(RateLimiter *limiter, ErrorInfo *error) {
-    if (!limiter) {
-        if (error) {
-            snprintf(error->message, MAX_ERROR_LENGTH, "Invalid rate limiter");
-            error->code = -1;
-        }
-        return;
-    }
-
-    time_t now = time(NULL);
+void apply_thread_safe_rate_limit(ThreadSafeRateLimiter *limiter, ErrorInfo *error) {
+    struct timespec wait_time;
     
+    pthread_mutex_lock(&limiter->mutex);
+    
+    time_t now = time(NULL);
     double time_since_last = difftime(now, limiter->last_request);
+
+    // Handle minimum interval
     if (time_since_last < limiter->min_interval) {
-        double sleep_time = limiter->min_interval - time_since_last;
-        if (sleep_time > 0) {
-            if (config.debug_mode) {
-                log_message("Rate limit: Sleeping for %.2f seconds", sleep_time);
-            }
-            usleep((useconds_t)(sleep_time * 1000000));
-        }
+        clock_gettime(CLOCK_REALTIME, &wait_time);
+        wait_time.tv_sec += (time_t)limiter->min_interval;
+        pthread_cond_timedwait(&limiter->rate_limit_cv, &limiter->mutex, &wait_time);
     }
 
+    // Reset window if needed
     if (difftime(now, limiter->last_request) >= limiter->window_size) {
         limiter->requests_in_window = 0;
         limiter->last_request = now;
     }
 
+    // Handle backoff if active
     if (limiter->backoff_active) {
-        double backoff_time = limiter->min_interval * limiter->backoff_multiplier;
-        if (config.debug_mode) {
-            log_message("Applying exponential backoff: %.2f seconds", backoff_time);
-        }
-        sleep((unsigned int)backoff_time);
+        clock_gettime(CLOCK_REALTIME, &wait_time);
+        wait_time.tv_sec += (time_t)(limiter->min_interval * limiter->backoff_multiplier);
+        pthread_cond_timedwait(&limiter->rate_limit_cv, &limiter->mutex, &wait_time);
     }
-    
-    if (limiter->requests_in_window >= limiter->max_requests) {
-        double wait_time = limiter->window_size - difftime(now, limiter->last_request);
-        if (wait_time > 0) {
-            if (config.debug_mode) {
-                log_message("Rate limit reached: Waiting %.2f seconds", wait_time);
-            }
-            sleep((unsigned int)wait_time);
+
+    // Wait if at rate limit
+    while (limiter->requests_in_window >= limiter->max_requests) {
+        clock_gettime(CLOCK_REALTIME, &wait_time);
+        wait_time.tv_sec = limiter->last_request + limiter->window_size;
+        pthread_cond_timedwait(&limiter->rate_limit_cv, &limiter->mutex, &wait_time);
+        
+        now = time(NULL);
+        if (difftime(now, limiter->last_request) >= limiter->window_size) {
             limiter->requests_in_window = 0;
-            limiter->last_request = time(NULL);
+            limiter->last_request = now;
         }
     }
 
+    // Update state
     limiter->requests_in_window++;
-    limiter->last_request = time(NULL);
+    limiter->active_requests++;
+    limiter->last_request = now;
+    
+    pthread_mutex_unlock(&limiter->mutex);
 }
-
-void handle_rate_limit_response(RateLimiter *limiter, int http_status) {
-    if (!limiter) return;
-
+void handle_thread_safe_rate_limit_response(ThreadSafeRateLimiter *limiter, 
+                                          int http_status, int response_time) {
+    pthread_mutex_lock(&limiter->mutex);
+    
+    limiter->active_requests--;
+    
+    // Update response time average
+    limiter->avg_response_time = (0.1 * response_time) + 
+                                (0.9 * limiter->avg_response_time);
+    
+    // Handle status code
     switch (http_status) {
         case 429: // Too Many Requests
-            if (!limiter->backoff_active) {
-                limiter->backoff_active = true;
-                limiter->backoff_multiplier = 1;
-            } else {
-                limiter->backoff_multiplier *= 2;
-                if (limiter->backoff_multiplier > 32) { // Cap the multiplier
-                    limiter->backoff_multiplier = 32;
-                }
-            }
-            
-            if (config.debug_mode) {
-                log_message("Rate limit exceeded. Backing off with multiplier: %d", 
-                           limiter->backoff_multiplier);
+            limiter->backoff_active = true;
+            limiter->backoff_multiplier *= 2;
+            if (limiter->backoff_multiplier > 32) {
+                limiter->backoff_multiplier = 32;
             }
             break;
 
-        case 200: // Successful request
+        case 200: // Success
             if (limiter->backoff_active) {
                 limiter->backoff_multiplier = limiter->backoff_multiplier > 1 ? 
                                             limiter->backoff_multiplier / 2 : 1;
@@ -1037,8 +1105,22 @@ void handle_rate_limit_response(RateLimiter *limiter, int http_status) {
             }
             break;
     }
+    
+    // Adjust rate limits based on performance
+    if (limiter->avg_response_time > 2000) {
+        limiter->max_requests = (int)(limiter->max_requests * 0.8);
+        if (limiter->max_requests < 10) limiter->max_requests = 10;
+    } else if (limiter->avg_response_time < 500 && 
+               limiter->max_requests < DEFAULT_MAX_REQUESTS) {
+        limiter->max_requests = (int)(limiter->max_requests * 1.1);
+        if (limiter->max_requests > DEFAULT_MAX_REQUESTS) {
+            limiter->max_requests = DEFAULT_MAX_REQUESTS;
+        }
+    }
+    
+    pthread_cond_broadcast(&limiter->rate_limit_cv);
+    pthread_mutex_unlock(&limiter->mutex);
 }
-
 void reset_rate_limiter(RateLimiter *limiter) {
     if (!limiter) return;
     
@@ -1074,6 +1156,21 @@ void adjust_rate_limits(RateLimiter *limiter, int response_time) {
 }
 
 
+void* monitor_thread_pool(void *arg) {
+    MonitorData *data = (MonitorData*)arg;
+    ThreadPool *pool = data->pool;
+    
+    while (data->active && !shutdown_requested) {
+        pthread_mutex_lock(&pool->thread_count_mutex);
+        log_message_threaded("Thread Pool Status - Active threads: %d, Queue size: %d", 
+                           pool->active_threads, pool->job_queue.size);
+        pthread_mutex_unlock(&pool->thread_count_mutex);
+        
+        sleep(5);  // Monitor every 5 seconds
+    }
+    
+    return NULL;
+}
 
 
 bool validate_response_format(const json_object *parsed_json, const Endpoint *endpoint) {
@@ -1947,7 +2044,7 @@ int fetch_data_threaded(const char* url, MemoryStruct* chunk, CURL *thread_curl,
     struct curl_slist *headers = NULL;
     long response_code = 0;
     double response_time = 0;
-
+    pthread_mutex_lock(&curl_mutex);
     const char* api_username = getenv("REPSLY_API_USERNAME");
     const char* api_password = getenv("REPSLY_API_PASSWORD");
     
@@ -1996,7 +2093,7 @@ int fetch_data_threaded(const char* url, MemoryStruct* chunk, CURL *thread_curl,
         }
         return -1;
     }
-
+    pthread_mutex_unlock(&curl_mutex);
     return 0;
 }
 
@@ -2174,8 +2271,10 @@ void cleanup_resources(char *begin_date, char *end_date, MemoryStruct *chunk,
     if (csv_state) cleanup_csv_state(csv_state);
 }
 
-void log_message(const char *format, ...) {
+void log_message_threaded(const char *format, ...) {
     if (!format) return;
+    
+    pthread_mutex_lock(&log_mutex);
     
     time_t now = time(NULL);
     char timestamp[26];
@@ -2198,6 +2297,8 @@ void log_message(const char *format, ...) {
     }
     
     va_end(args);
+    
+    pthread_mutex_unlock(&log_mutex);
 }
 
 void print_help(void) {
@@ -2221,9 +2322,21 @@ void print_help(void) {
     printf("  -h, --help              Display this help message\n");
 }
 
+void signal_handler(int signum) {
+    shutdown_requested = 1;
+}
+
+
 int main(int argc, char *argv[]) {
     int result = 0;
+    MonitorData monitor_data = {0};
+    pthread_t monitor_thread;
     
+    // Setup signal handlers
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+    
+    // Initialize configuration with defaults
     config.rate_limit = DEFAULT_RATE_LIMIT_SECONDS;
     config.page_size = DEFAULT_PAGE_SIZE;
     config.retry_attempts = DEFAULT_RETRY_ATTEMPTS;
@@ -2241,55 +2354,69 @@ int main(int argc, char *argv[]) {
     config.update_cache = 0;
     config.log_file = NULL;
     
+    // Parse command line and initialize
     parse_command_line(argc, argv);
     initialize_app();
     
+    // Initialize thread pool
     ThreadPool pool;
     if (init_thread_pool(&pool, MAX_THREADS) != 0) {
-        log_message("Failed to initialize thread pool");
-        cleanup_app();
-        return 1;
+        handle_critical_error("Failed to initialize thread pool", NULL);
     }
-
+    
+    // Start monitoring thread if in debug mode
+    if (config.debug_mode) {
+        monitor_data.pool = &pool;
+        monitor_data.active = true;
+        if (pthread_create(&monitor_thread, NULL, monitor_thread_pool, &monitor_data) != 0) {
+            log_message_threaded("Warning: Failed to create monitoring thread");
+        }
+    }
+    
+    // Allocate job array
     int max_jobs = num_endpoints;
     Job **jobs = calloc(max_jobs, sizeof(Job*));
     if (!jobs) {
-        log_message("Failed to allocate memory for jobs");
-        cleanup_thread_pool(&pool);
-        cleanup_app();
-        return 1;
+        handle_critical_error("Failed to allocate memory for jobs", &pool);
     }
-
+    
     int job_count = 0;
-
-    for (int i = 0; i < num_endpoints; i++) {
+    
+    // Create and queue jobs
+    for (int i = 0; i < num_endpoints && !shutdown_requested; i++) {
         if (config.specific_endpoint && 
             strcmp(config.specific_endpoint, endpoints[i].name) != 0) {
             continue;
         }
-
+        
         Job* job = create_job(&endpoints[i], 
                             config.output_directory ? config.output_directory : ".");
         if (!job) {
-            log_message("Failed to create job for endpoint: %s", endpoints[i].name);
+            log_message_threaded("Failed to create job for endpoint: %s", endpoints[i].name);
             continue;
         }
-
+        
         jobs[job_count++] = job;
         
         if (!enqueue_job(&pool.job_queue, job)) {
-            log_message("Failed to enqueue job for endpoint: %s", endpoints[i].name);
+            log_message_threaded("Failed to enqueue job for endpoint: %s", endpoints[i].name);
             destroy_job(job);
             jobs[job_count - 1] = NULL;
             job_count--;
         }
     }
-
+    
+    // Wait for jobs to complete or shutdown
     bool all_complete;
     do {
+        if (shutdown_requested) {
+            log_message_threaded("Shutdown requested, waiting for active jobs to complete...");
+            break;
+        }
+        
         all_complete = true;
-        sleep(1);  // Check every second
-
+        sleep(1);
+        
         pthread_mutex_lock(&pool.thread_count_mutex);
         for (int i = 0; i < job_count; i++) {
             if (jobs[i] && !jobs[i]->completed) {
@@ -2298,34 +2425,58 @@ int main(int argc, char *argv[]) {
             }
         }
         pthread_mutex_unlock(&pool.thread_count_mutex);
-
+        
     } while (!all_complete && pool.active_threads > 0);
-
+    
+    // Stop monitoring thread if active
+    if (config.debug_mode) {
+        monitor_data.active = false;
+        pthread_join(monitor_thread, NULL);
+    }
+    
+    // Check for failed jobs
     for (int i = 0; i < job_count; i++) {
         if (jobs[i] && jobs[i]->error.code != 0) {
-            log_message("Job failed for endpoint %s: %s", 
-                       jobs[i]->endpoint->name, jobs[i]->error.message);
+            log_message_threaded("Job failed for endpoint %s: %s", 
+                               jobs[i]->endpoint->name, jobs[i]->error.message);
             result = 1;
         }
     }
-
-    if (result == 0) {
+    
+    // Merge output files if successful and not shutdown
+    if (result == 0 && !shutdown_requested) {
         if (!merge_all_temp_files(jobs, job_count, 
                                 config.output_directory ? config.output_directory : ".")) {
-            log_message("Failed to merge output files");
+            log_message_threaded("Failed to merge output files");
             result = 1;
         }
     }
-
+    
+    // Cleanup jobs
     for (int i = 0; i < job_count; i++) {
         if (jobs[i]) {
+            // If shutdown requested and job not completed, log it
+            if (shutdown_requested && !jobs[i]->completed) {
+                log_message_threaded("Job for endpoint %s was interrupted", 
+                                   jobs[i]->endpoint->name);
+            }
             destroy_job(jobs[i]);
         }
     }
     free(jobs);
-
-    cleanup_thread_pool(&pool);
-    cleanup_app();
+    
+    // Final cleanup
+    cleanup_thread_pool_resources(&pool);
+    enhanced_cleanup_app();
+    
+    #ifdef DEBUG
+    check_memory_leaks();
+    #endif
+    
+    // Log completion status
+    log_message_threaded("Application %s. Processed %d endpoints.", 
+                        result == 0 ? "completed successfully" : "completed with errors",
+                        job_count);
     
     return result;
 }
