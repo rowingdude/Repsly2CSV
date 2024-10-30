@@ -159,10 +159,21 @@ typedef struct {
     int total_requests;
 } ThreadSafeRateLimiter;
 
+typedef struct {
+    char *source_file;
+    char *target_file;
+    bool is_first;
+    const char *format;
+} FileMergeTask;
+
+
 /* Globals */
 CURL *curl_handle;
 AppConfig config = {0};
 FILE *log_file_ptr = NULL;
+
+pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t curl_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* Function Declarations */
 
@@ -1508,6 +1519,17 @@ void cleanup_csv_state(CSVState *csv_state) {
     csv_state->last_row_size = 0;
 }
 
+void cleanup_temp_files(Job **completed_jobs, int job_count) {
+    for (int i = 0; i < job_count; i++) {
+        if (completed_jobs[i] && completed_jobs[i]->temp_filename) {
+            if (remove(completed_jobs[i]->temp_filename) != 0) {
+                log_message("Warning: Failed to remove temporary file: %s", 
+                          completed_jobs[i]->temp_filename);
+            }
+        }
+    }
+}
+
 bool validate_csv_file(const char *filename) {
     FILE *file = fopen(filename, "r");
     if (!file) return false;
@@ -1570,7 +1592,250 @@ void merge_csv_files(const char *input_file, const char *output_file, bool appen
     fclose(out);
 }
 
+bool merge_csv_files_threaded(const char *temp_file, const char *final_file, bool is_first) {
+    FILE *source = fopen(temp_file, "r");
+    if (!source) {
+        log_message("Failed to open temporary file: %s", temp_file);
+        return false;
+    }
 
+    FILE *target = fopen(final_file, is_first ? "w" : "a");
+    if (!target) {
+        fclose(source);
+        log_message("Failed to open final file: %s", final_file);
+        return false;
+    }
+
+    char buffer[MAX_BUFFER];
+    bool skip_header = !is_first;
+    bool first_line = true;
+
+    while (fgets(buffer, sizeof(buffer), source)) {
+        if (skip_header && first_line) {
+            first_line = false;
+            continue;
+        }
+        fputs(buffer, target);
+    }
+
+    fclose(source);
+    fclose(target);
+    return true;
+}
+
+bool merge_json_files_threaded(const char *temp_file, const char *final_file, bool is_first) {
+    FILE *source = fopen(temp_file, "r");
+    if (!source) {
+        log_message("Failed to open temporary file: %s", temp_file);
+        return false;
+    }
+
+    FILE *target = fopen(final_file, is_first ? "w" : "a");
+    if (!target) {
+        fclose(source);
+        log_message("Failed to open final file: %s", final_file);
+        return false;
+    }
+
+    // Buffer for reading JSON content
+    char buffer[MAX_BUFFER];
+    bool in_array = false;
+    bool skip_brackets = !is_first;
+    int bracket_depth = 0;
+
+    while (fgets(buffer, sizeof(buffer), source)) {
+        char *pos = buffer;
+        
+        // Skip initial brackets if not first file
+        if (skip_brackets) {
+            if (strstr(buffer, "[")) {
+                pos = strchr(buffer, '[') + 1;
+                skip_brackets = false;
+            } else {
+                continue;
+            }
+        }
+
+        // Handle array elements
+        if (!is_first && !in_array) {
+            if (strchr(pos, '[')) {
+                in_array = true;
+                fprintf(target, ",\n");  // Add comma before new elements
+            }
+        }
+
+        fputs(pos, target);
+    }
+
+    fclose(source);
+    fclose(target);
+    return true;
+}
+
+
+bool merge_all_temp_files(Job **completed_jobs, int job_count, const char *output_dir) {
+    if (job_count == 0) return true;
+
+    // Group jobs by endpoint
+    typedef struct {
+        const Endpoint *endpoint;
+        Job **jobs;
+        int count;
+    } EndpointGroup;
+
+    EndpointGroup *groups = calloc(num_endpoints, sizeof(EndpointGroup));
+    if (!groups) {
+        log_message("Failed to allocate memory for endpoint groups");
+        return false;
+    }
+
+    // Initialize groups
+    int group_count = 0;
+    for (int i = 0; i < job_count; i++) {
+        const Endpoint *current_endpoint = completed_jobs[i]->endpoint;
+        bool found = false;
+
+        for (int j = 0; j < group_count; j++) {
+            if (groups[j].endpoint == current_endpoint) {
+                groups[j].count++;
+                found = true;
+                break;
+            }
+        }
+
+        if (!found) {
+            groups[group_count].endpoint = current_endpoint;
+            groups[group_count].count = 1;
+            group_count++;
+        }
+    }
+
+    // Allocate job arrays for each group
+    for (int i = 0; i < group_count; i++) {
+        groups[i].jobs = calloc(groups[i].count, sizeof(Job*));
+        if (!groups[i].jobs) {
+            log_message("Failed to allocate memory for group jobs");
+            // Cleanup previously allocated arrays
+            for (int j = 0; j < i; j++) {
+                free(groups[j].jobs);
+            }
+            free(groups);
+            return false;
+        }
+    }
+
+    // Fill groups with jobs
+    int *group_indices = calloc(group_count, sizeof(int));
+    for (int i = 0; i < job_count; i++) {
+        for (int j = 0; j < group_count; j++) {
+            if (groups[j].endpoint == completed_jobs[i]->endpoint) {
+                groups[j].jobs[group_indices[j]++] = completed_jobs[i];
+                break;
+            }
+        }
+    }
+
+    // Process each group
+    bool success = true;
+    for (int i = 0; i < group_count; i++) {
+        char final_filename[MAX_URL_LENGTH];
+        snprintf(final_filename, sizeof(final_filename), "%s/Repsly_%s_Export.%s",
+                output_dir, groups[i].endpoint->key, config.export_format);
+
+        // Merge files for this group
+        for (int j = 0; j < groups[i].count; j++) {
+            bool is_first = (j == 0);
+            bool merge_success;
+
+            if (strcmp(config.export_format, "csv") == 0) {
+                merge_success = merge_csv_files_threaded(
+                    groups[i].jobs[j]->temp_filename,
+                    final_filename,
+                    is_first
+                );
+            } else {  // JSON
+                merge_success = merge_json_files_threaded(
+                    groups[i].jobs[j]->temp_filename,
+                    final_filename,
+                    is_first
+                );
+            }
+
+            if (!merge_success) {
+                log_message("Failed to merge file for endpoint: %s", 
+                          groups[i].endpoint->name);
+                success = false;
+                break;
+            }
+        }
+    }
+
+    // Cleanup
+    for (int i = 0; i < group_count; i++) {
+        free(groups[i].jobs);
+    }
+    free(groups);
+    free(group_indices);
+
+    // Clean up temporary files
+    if (success) {
+        cleanup_temp_files(completed_jobs, job_count);
+    }
+
+    return success;
+}
+
+// Helper function to validate merged files
+bool validate_merged_file(const char *filename, const char *format) {
+    FILE *file = fopen(filename, "r");
+    if (!file) return false;
+
+    bool is_valid = true;
+    char buffer[MAX_BUFFER];
+
+    if (strcmp(format, "csv") == 0) {
+        // Validate CSV structure
+        int field_count = -1;
+        int line = 0;
+        
+        while (fgets(buffer, sizeof(buffer), file) && line < 10) {
+            int current_fields = 1;
+            bool in_quotes = false;
+            
+            for (char *p = buffer; *p; p++) {
+                if (*p == '"') in_quotes = !in_quotes;
+                else if (*p == ',' && !in_quotes) current_fields++;
+            }
+            
+            if (field_count == -1) field_count = current_fields;
+            else if (field_count != current_fields) {
+                is_valid = false;
+                break;
+            }
+            line++;
+        }
+    } else {  // JSON
+        // Basic JSON structure validation
+        int brace_count = 0;
+        int bracket_count = 0;
+        
+        while (fgets(buffer, sizeof(buffer), file)) {
+            for (char *p = buffer; *p; p++) {
+                if (*p == '{') brace_count++;
+                else if (*p == '}') brace_count--;
+                else if (*p == '[') bracket_count++;
+                else if (*p == ']') bracket_count--;
+            }
+        }
+        
+        is_valid = (brace_count == 0 && bracket_count == 0);
+    }
+
+    fclose(file);
+    return is_valid;
+}
+
+/* Leaving this here until the new threading pool scheme is validated*/
 int process_endpoint(const Endpoint *endpoint) {
     if (!endpoint) return -1;
 
@@ -1788,6 +2053,252 @@ cleanup:
     cleanup_csv_state(&csv_state);
 
     return result;
+}
+
+int process_endpoint_threaded(const Endpoint *endpoint, const char *temp_filename, 
+                            ThreadSafeRateLimiter *rate_limiter, ErrorInfo *error) {
+    if (!endpoint) return -1;
+
+    char url[MAX_URL_LENGTH] = {0};
+    MemoryStruct chunk = {0};
+    char last_id[64] = "0";
+    PaginationState pagination = {0};
+    int skip = 0;
+    char *begin_date = NULL;
+    char *end_date = NULL;
+    FILE *output_file = NULL;
+    int result = -1;
+    CSVState csv_state = {0};
+    bool first_batch = true;
+    time_t now = time(NULL);
+
+    if (config.from_date) {
+        begin_date = strdup(config.from_date);
+    } else {
+        time_t start = now - (endpoint->default_date_range_days * 24 * 60 * 60);
+        struct tm tm_start = {0};
+        localtime_r(&start, &tm_start);  // Thread-safe version of localtime
+        begin_date = malloc(MAX_DATE_LENGTH);
+        if (begin_date) {
+            strftime(begin_date, MAX_DATE_LENGTH, "%Y-%m-%d", &tm_start);
+        }
+    }
+
+    if (config.to_date) {
+        end_date = strdup(config.to_date);
+    } else {
+        end_date = malloc(MAX_DATE_LENGTH);
+        if (end_date) {
+            struct tm tm_now = {0};
+            localtime_r(&now, &tm_now);
+            strftime(end_date, MAX_DATE_LENGTH, "%Y-%m-%d", &tm_now);
+        }
+    }
+
+    if (!begin_date || !end_date) {
+        log_message("[%s] Failed to initialize dates", endpoint->name);
+        goto cleanup;
+    }
+
+    chunk.memory = malloc(1);
+    if (!chunk.memory) {
+        log_message("[%s] Failed to allocate initial memory", endpoint->name);
+        goto cleanup;
+    }
+    chunk.size = 0;
+
+    CURL *thread_curl = curl_easy_init();
+    if (!thread_curl) {
+        log_message("[%s] Failed to initialize CURL", endpoint->name);
+        goto cleanup;
+    }
+
+    output_file = fopen(temp_filename, strcmp(config.export_format, "csv") == 0 ? "w" : "a");
+    if (!output_file) {
+        log_message("[%s] Failed to open output file %s", endpoint->name, temp_filename);
+        goto cleanup;
+    }
+
+    if (strcmp(config.export_format, "json") == 0) {
+        fprintf(output_file, "{\n\"%s\": [\n", endpoint->key);
+    }
+
+    pagination.page_number = 1;
+    pagination.has_more = true;
+    pagination.records_processed = 0;
+
+    while (pagination.has_more && pagination.page_number < config.max_iterations) {
+        construct_url(url, sizeof(url), endpoint, last_id, skip, begin_date, end_date, error);
+        if (error->code != 0) {
+            handle_error(error);
+            break;
+        }
+
+        if (config.verbose_mode) {
+            pthread_mutex_lock(&log_mutex);  // Add this mutex to globals
+            log_message("[%s] Requesting page %d (processed %d records)", 
+                       endpoint->name, pagination.page_number, pagination.records_processed);
+            if (config.debug_mode) {
+                log_message("URL: %s", url);
+            }
+            pthread_mutex_unlock(&log_mutex);
+        }
+
+        bool fetch_success = false;
+        for (int retry = 0; retry < config.retry_attempts; retry++) {
+            if (fetch_data_threaded(url, &chunk, thread_curl, rate_limiter, error) == 0) {
+                fetch_success = true;
+                break;
+            }
+            handle_error(error);
+            if (error->code >= 400 && error->code < 500) break;
+        }
+
+        if (!fetch_success) {
+            log_message("[%s] Failed to fetch data after %d attempts", 
+                       endpoint->name, config.retry_attempts);
+            break;
+        }
+
+        struct json_object *parsed_json = json_tokener_parse(chunk.memory);
+        if (!parsed_json || !validate_response_format(parsed_json, endpoint)) {
+            log_message("[%s] Invalid JSON response", endpoint->name);
+            if (parsed_json) json_object_put(parsed_json);
+            break;
+        }
+
+        struct json_object *items;
+        json_object_object_get_ex(parsed_json, endpoint->key, &items);
+        int n_items = json_object_array_length(items);
+
+        if (n_items == 0) {
+            json_object_put(parsed_json);
+            result = 0;
+            break;
+        }
+
+        if (strcmp(config.export_format, "csv") == 0) {
+            if (first_batch) {
+                write_csv_header(output_file, items, &csv_state);
+                first_batch = false;
+            }
+            
+            for (int i = 0; i < n_items; i++) {
+                struct json_object *item = json_object_array_get_idx(items, i);
+                if (!is_duplicate_record(item, last_id, endpoint->use_timestamp_pagination)) {
+                    write_csv_row(output_file, item, !endpoint->use_raw_timestamp, &csv_state);
+                    pagination.records_processed++;
+                }
+            }
+        } else if (strcmp(config.export_format, "json") == 0) {
+            for (int i = 0; i < n_items; i++) {
+                if (!first_batch || i > 0) {
+                    fprintf(output_file, ",\n");
+                }
+                fprintf(output_file, "%s", 
+                        json_object_to_json_string_ext(
+                            json_object_array_get_idx(items, i), 
+                            JSON_C_TO_STRING_PRETTY));
+                first_batch = false;
+                pagination.records_processed++;
+            }
+        }
+
+        if (!update_pagination(endpoint, parsed_json, last_id, sizeof(last_id), 
+                             &skip, &begin_date, &end_date)) {
+            pagination.has_more = false;
+        }
+
+        json_object_put(parsed_json);
+
+        free(chunk.memory);
+        chunk.memory = malloc(1);
+        if (!chunk.memory) {
+            log_message("[%s] Failed to allocate memory for chunk", endpoint->name);
+            break;
+        }
+        chunk.size = 0;
+
+        pagination.page_number++;
+    }
+
+    if (strcmp(config.export_format, "json") == 0) {
+        fprintf(output_file, "\n]\n}");
+    }
+
+    result = 0;
+
+cleanup:
+    if (output_file) fclose(output_file);
+    if (chunk.memory) free(chunk.memory);
+    if (begin_date) free(begin_date);
+    if (end_date) free(end_date);
+    if (thread_curl) curl_easy_cleanup(thread_curl);
+    cleanup_csv_state(&csv_state);
+
+    return result;
+}
+
+int fetch_data_threaded(const char* url, MemoryStruct* chunk, CURL *thread_curl,
+                       ThreadSafeRateLimiter* rate_limiter, ErrorInfo *error) {
+    apply_thread_safe_rate_limit(rate_limiter, error);
+    if (error && error->code != 0) return -1;
+
+    CURLcode res;
+    struct curl_slist *headers = NULL;
+    long response_code = 0;
+    double response_time = 0;
+
+    const char* api_username = getenv("REPSLY_API_USERNAME");
+    const char* api_password = getenv("REPSLY_API_PASSWORD");
+    
+    if (!api_username || !api_password) {
+        if (error) {
+            snprintf(error->message, MAX_ERROR_LENGTH, 
+                    "API credentials not set. Please set REPSLY_API_USERNAME and REPSLY_API_PASSWORD environment variables.");
+            error->code = -1;
+        }
+        return -1;
+    }
+
+    curl_easy_setopt(thread_curl, CURLOPT_URL, url);
+    curl_easy_setopt(thread_curl, CURLOPT_WRITEFUNCTION, write_memory_callback);
+    curl_easy_setopt(thread_curl, CURLOPT_WRITEDATA, (void *)chunk);
+    curl_easy_setopt(thread_curl, CURLOPT_USERNAME, api_username);
+    curl_easy_setopt(thread_curl, CURLOPT_PASSWORD, api_password);
+    curl_easy_setopt(thread_curl, CURLOPT_TIMEOUT, config.timeout);
+
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    curl_easy_setopt(thread_curl, CURLOPT_HTTPHEADER, headers);
+
+    res = curl_easy_perform(thread_curl);
+    
+    curl_slist_free_all(headers);
+
+    if (res != CURLE_OK) {
+        if (error) {
+            snprintf(error->message, MAX_ERROR_LENGTH, 
+                    "CURL error: %s", curl_easy_strerror(res));
+            error->code = res;
+        }
+        return -1;
+    }
+
+    curl_easy_getinfo(thread_curl, CURLINFO_RESPONSE_CODE, &response_code);
+    curl_easy_getinfo(thread_curl, CURLINFO_TOTAL_TIME, &response_time);
+
+    handle_thread_safe_rate_limit_response(rate_limiter, response_code, (int)(response_time * 1000));
+
+    if (response_code != 200) {
+        if (error) {
+            snprintf(error->message, MAX_ERROR_LENGTH, 
+                    "HTTP error: %ld", response_code);
+            error->code = response_code;
+        }
+        return -1;
+    }
+
+    return 0;
 }
 
 void construct_url(char *url, size_t url_size, const Endpoint *endpoint, 
@@ -2034,18 +2545,87 @@ int main(int argc, char *argv[]) {
     parse_command_line(argc, argv);
     initialize_app();
     
+    ThreadPool pool;
+    if (init_thread_pool(&pool, MAX_THREADS) != 0) {
+        log_message("Failed to initialize thread pool");
+        cleanup_app();
+        return 1;
+    }
+
+    int max_jobs = num_endpoints;
+    Job **jobs = calloc(max_jobs, sizeof(Job*));
+    if (!jobs) {
+        log_message("Failed to allocate memory for jobs");
+        cleanup_thread_pool(&pool);
+        cleanup_app();
+        return 1;
+    }
+
+    int job_count = 0;
+
     for (int i = 0; i < num_endpoints; i++) {
         if (config.specific_endpoint && 
             strcmp(config.specific_endpoint, endpoints[i].name) != 0) {
-            continue;  // Skip non-matching endpoints
+            continue;
         }
+
+        Job* job = create_job(&endpoints[i], 
+                            config.output_directory ? config.output_directory : ".");
+        if (!job) {
+            log_message("Failed to create job for endpoint: %s", endpoints[i].name);
+            continue;
+        }
+
+        jobs[job_count++] = job;
         
-        if (process_endpoint(&endpoints[i]) != 0) {
-            log_message("Error processing endpoint: %s", endpoints[i].name);
+        if (!enqueue_job(&pool.job_queue, job)) {
+            log_message("Failed to enqueue job for endpoint: %s", endpoints[i].name);
+            destroy_job(job);
+            jobs[job_count - 1] = NULL;
+            job_count--;
+        }
+    }
+
+    bool all_complete;
+    do {
+        all_complete = true;
+        sleep(1);  // Check every second
+
+        pthread_mutex_lock(&pool.thread_count_mutex);
+        for (int i = 0; i < job_count; i++) {
+            if (jobs[i] && !jobs[i]->completed) {
+                all_complete = false;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&pool.thread_count_mutex);
+
+    } while (!all_complete && pool.active_threads > 0);
+
+    for (int i = 0; i < job_count; i++) {
+        if (jobs[i] && jobs[i]->error.code != 0) {
+            log_message("Job failed for endpoint %s: %s", 
+                       jobs[i]->endpoint->name, jobs[i]->error.message);
             result = 1;
         }
     }
-    
+
+    if (result == 0) {
+        if (!merge_all_temp_files(jobs, job_count, 
+                                config.output_directory ? config.output_directory : ".")) {
+            log_message("Failed to merge output files");
+            result = 1;
+        }
+    }
+
+    for (int i = 0; i < job_count; i++) {
+        if (jobs[i]) {
+            destroy_job(jobs[i]);
+        }
+    }
+    free(jobs);
+
+    cleanup_thread_pool(&pool);
     cleanup_app();
     
     return result;
