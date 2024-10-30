@@ -24,6 +24,9 @@
 #define DEFAULT_RETRY_ATTEMPTS 3
 #define DEFAULT_TIMEOUT 30
 #define DEFAULT_MAX_ITERATIONS 1000
+#define DEFAULT_WINDOW_SIZE 60  
+#define DEFAULT_MAX_REQUESTS 60 
+#define MIN_REQUEST_INTERVAL 1  
 
 /* Configuration Structure */
 typedef struct {
@@ -100,6 +103,16 @@ typedef struct {
     const char *url;
 } ErrorInfo;
 
+typedef struct {
+    time_t last_request;       
+    int requests_in_window;    
+    int window_size;           
+    int max_requests;          
+    double min_interval;       
+    bool backoff_active;       
+    int backoff_multiplier;    
+} RateLimiter;
+
 /* Globals */
 CURL *curl_handle;
 AppConfig config = {0};
@@ -127,6 +140,13 @@ int fetch_data_with_backoff(const char* url, MemoryStruct* chunk, int attempt, E
 char* get_current_datetime(void);
 char* convert_date(const char* date_string);
 void split_date_range(const char *start_date, const char *end_date, char **current_start, char **current_end);
+
+void init_rate_limiter(RateLimiter *limiter);
+void apply_rate_limit(RateLimiter *limiter, ErrorInfo *error);
+void handle_rate_limit_response(RateLimiter *limiter, int http_status);
+void reset_rate_limiter(RateLimiter *limiter);
+void adjust_rate_limits(RateLimiter *limiter, int response_time);
+
 
 void construct_url(char *url, size_t url_size, const Endpoint *endpoint, 
                   const char *last_id, int skip, const char *begin_date, 
@@ -469,21 +489,23 @@ static size_t write_memory_callback(void *contents, size_t size, size_t nmemb, v
     return realsize;
 }
 
-int fetch_data_with_backoff(const char* url, MemoryStruct* chunk, int attempt, ErrorInfo *error) {
-    if (attempt > 1) {
-        int delay = (int)(pow(2, attempt - 1) * config.rate_limit);
-        delay += rand() % config.rate_limit;  // Add jitter
-        sleep(delay);
-    }
-    
-    return fetch_data(url, chunk, error);
-}
-
 int fetch_data(const char* url, MemoryStruct* chunk, ErrorInfo *error) {
+    static RateLimiter limiter = {0};
+    static bool limiter_initialized = false;
+    
+    if (!limiter_initialized) {
+        init_rate_limiter(&limiter);
+        limiter_initialized = true;
+    }
+
     CURLcode res;
     struct curl_slist *headers = NULL;
     long response_code = 0;
+    long response_time = 0;
     
+    apply_rate_limit(&limiter, error);
+    if (error && error->code != 0) return -1;
+
     const char* api_username = getenv("REPSLY_API_USERNAME");
     const char* api_password = getenv("REPSLY_API_PASSWORD");
     
@@ -505,9 +527,7 @@ int fetch_data(const char* url, MemoryStruct* chunk, ErrorInfo *error) {
     
     headers = curl_slist_append(headers, "Content-Type: application/json");
     curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
-    
     res = curl_easy_perform(curl_handle);
-    
     curl_slist_free_all(headers);
     
     if (res != CURLE_OK) {
@@ -520,7 +540,10 @@ int fetch_data(const char* url, MemoryStruct* chunk, ErrorInfo *error) {
     }
     
     curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE, &response_code);
-    
+    curl_easy_getinfo(curl_handle, CURLINFO_TOTAL_TIME, &response_time);
+    handle_rate_limit_response(&limiter, response_code);
+    adjust_rate_limits(&limiter, (int)(response_time * 1000));
+
     if (response_code != 200) {
         if (error) {
             snprintf(error->message, MAX_ERROR_LENGTH, 
@@ -743,6 +766,154 @@ void split_date_range(const char *start_date, const char *end_date,
     current_tm = *localtime(&current_time);
     strftime(*current_end, MAX_DATE_LENGTH, "%Y-%m-%d", &current_tm);
 }
+
+bool validate_date_format(const char *date) {
+    if (!date) return false;
+    
+    size_t len = strlen(date);
+    if (len != 10) return false;
+    if (date[4] != '-' || date[7] != '-') return false;
+
+    int year, month, day;
+    if (sscanf(date, "%d-%d-%d", &year, &month, &day) != 3) return false;    
+    if (year < 1900 || year > 2100) return false;
+    if (month < 1 || month > 12) return false;
+    if (day < 1 || day > 31) return false;
+    
+    return true;
+}
+
+
+void init_rate_limiter(RateLimiter *limiter) {
+    if (!limiter) return;
+    
+    limiter->last_request = 0;
+    limiter->requests_in_window = 0;
+    limiter->window_size = DEFAULT_WINDOW_SIZE;
+    limiter->max_requests = DEFAULT_MAX_REQUESTS;
+    limiter->min_interval = MIN_REQUEST_INTERVAL;
+    limiter->backoff_active = false;
+    limiter->backoff_multiplier = 1;
+}
+
+
+void apply_rate_limit(RateLimiter *limiter, ErrorInfo *error) {
+    if (!limiter) {
+        if (error) {
+            snprintf(error->message, MAX_ERROR_LENGTH, "Invalid rate limiter");
+            error->code = -1;
+        }
+        return;
+    }
+
+    time_t now = time(NULL);
+    
+    double time_since_last = difftime(now, limiter->last_request);
+    if (time_since_last < limiter->min_interval) {
+        double sleep_time = limiter->min_interval - time_since_last;
+        if (sleep_time > 0) {
+            if (config.debug_mode) {
+                log_message("Rate limit: Sleeping for %.2f seconds", sleep_time);
+            }
+            usleep((useconds_t)(sleep_time * 1000000));
+        }
+    }
+
+    if (difftime(now, limiter->last_request) >= limiter->window_size) {
+        limiter->requests_in_window = 0;
+        limiter->last_request = now;
+    }
+
+    if (limiter->backoff_active) {
+        double backoff_time = limiter->min_interval * limiter->backoff_multiplier;
+        if (config.debug_mode) {
+            log_message("Applying exponential backoff: %.2f seconds", backoff_time);
+        }
+        sleep((unsigned int)backoff_time);
+    }
+    
+    if (limiter->requests_in_window >= limiter->max_requests) {
+        double wait_time = limiter->window_size - difftime(now, limiter->last_request);
+        if (wait_time > 0) {
+            if (config.debug_mode) {
+                log_message("Rate limit reached: Waiting %.2f seconds", wait_time);
+            }
+            sleep((unsigned int)wait_time);
+            limiter->requests_in_window = 0;
+            limiter->last_request = time(NULL);
+        }
+    }
+
+    limiter->requests_in_window++;
+    limiter->last_request = time(NULL);
+}
+
+void handle_rate_limit_response(RateLimiter *limiter, int http_status) {
+    if (!limiter) return;
+
+    switch (http_status) {
+        case 429: // Too Many Requests
+            if (!limiter->backoff_active) {
+                limiter->backoff_active = true;
+                limiter->backoff_multiplier = 1;
+            } else {
+                limiter->backoff_multiplier *= 2;
+                if (limiter->backoff_multiplier > 32) { // Cap the multiplier
+                    limiter->backoff_multiplier = 32;
+                }
+            }
+            
+            if (config.debug_mode) {
+                log_message("Rate limit exceeded. Backing off with multiplier: %d", 
+                           limiter->backoff_multiplier);
+            }
+            break;
+
+        case 200: // Successful request
+            if (limiter->backoff_active) {
+                limiter->backoff_multiplier = limiter->backoff_multiplier > 1 ? 
+                                            limiter->backoff_multiplier / 2 : 1;
+                if (limiter->backoff_multiplier == 1) {
+                    limiter->backoff_active = false;
+                }
+            }
+            break;
+
+        default:
+            if (!limiter->backoff_active) {
+                limiter->backoff_active = true;
+                limiter->backoff_multiplier = 1;
+            }
+            break;
+    }
+}
+
+void reset_rate_limiter(RateLimiter *limiter) {
+    if (!limiter) return;
+    
+    limiter->requests_in_window = 0;
+    limiter->last_request = time(NULL);
+    limiter->backoff_active = false;
+    limiter->backoff_multiplier = 1;
+}
+
+void adjust_rate_limits(RateLimiter *limiter, int response_time) {
+    if (!limiter) return;
+
+    if (response_time > 2000) { // If response takes more than 2 seconds
+        limiter->max_requests = (int)(limiter->max_requests * 0.8); // Reduce by 20%
+        if (limiter->max_requests < 10) { // Don't go too low
+            limiter->max_requests = 10;
+        }
+    } else if (response_time < 500 && limiter->max_requests < DEFAULT_MAX_REQUESTS) {
+        limiter->max_requests = (int)(limiter->max_requests * 1.1); // Increase by 10%
+        if (limiter->max_requests > DEFAULT_MAX_REQUESTS) {
+            limiter->max_requests = DEFAULT_MAX_REQUESTS;
+        }
+    }
+}
+
+
 
 
 bool validate_response_format(const json_object *parsed_json, const Endpoint *endpoint) {
@@ -1192,30 +1363,56 @@ void merge_csv_files(const char *input_file, const char *output_file, bool appen
 
 int process_endpoint(const Endpoint *endpoint) {
     if (!endpoint) return -1;
-    
-    char url[MAX_URL_LENGTH];
+
+    char url[MAX_URL_LENGTH] = {0};
     MemoryStruct chunk = {0};
     char last_id[64] = "0";
-    size_t last_id_size = sizeof(last_id);
-    char filename[MAX_URL_LENGTH];
-    char cache_filename[MAX_URL_LENGTH];
+    char filename[MAX_URL_LENGTH] = {0};
+    char cache_filename[MAX_URL_LENGTH] = {0};
     PaginationState pagination = {0};
     int skip = 0;
     char *begin_date = NULL;
     char *end_date = NULL;
     FILE *output_file = NULL;
-    int result = 0;
+    int result = -1;
     CSVState csv_state = {0};
     ErrorInfo error = {0};
     bool first_batch = true;
-    
+    time_t now = time(NULL);
+
+    if (config.from_date) {
+        begin_date = strdup(config.from_date);
+    } else {
+        time_t start = now - (endpoint->default_date_range_days * 24 * 60 * 60);
+        struct tm *tm_start = localtime(&start);
+        begin_date = malloc(MAX_DATE_LENGTH);
+        if (begin_date) {
+            strftime(begin_date, MAX_DATE_LENGTH, "%Y-%m-%d", tm_start);
+        }
+    }
+
+    if (config.to_date) {
+        end_date = strdup(config.to_date);
+    } else {
+        end_date = malloc(MAX_DATE_LENGTH);
+        if (end_date) {
+            struct tm *tm_now = localtime(&now);
+            strftime(end_date, MAX_DATE_LENGTH, "%Y-%m-%d", tm_now);
+        }
+    }
+
+    if (!begin_date || !end_date) {
+        log_message("[%s] Failed to initialize dates", endpoint->name);
+        goto cleanup;
+    }
+
     chunk.memory = malloc(1);
     if (!chunk.memory) {
-        log_message("Failed to allocate initial memory for %s", endpoint->name);
-        return -1;
+        log_message("[%s] Failed to allocate initial memory", endpoint->name);
+        goto cleanup;
     }
     chunk.size = 0;
-    
+
     if (config.output_directory) {
         snprintf(filename, sizeof(filename), "%s/Repsly_%s_Export.%s", 
                 config.output_directory, endpoint->key, config.export_format);
@@ -1227,66 +1424,36 @@ int process_endpoint(const Endpoint *endpoint) {
         snprintf(cache_filename, sizeof(cache_filename), "Repsly_%s_cache.txt", 
                 endpoint->key);
     }
-    
+
     if (endpoint->pagination_type != NONE && config.use_cache) {
-        if (!load_cache(cache_filename, last_id, last_id_size)) {
+        if (!load_cache(cache_filename, last_id, sizeof(last_id))) {
             if (endpoint->pagination_type == TIMESTAMP) {
                 strcpy(last_id, "0");
             }
         }
     }
-    
+
     output_file = fopen(filename, strcmp(config.export_format, "csv") == 0 ? "w" : "a");
     if (!output_file) {
-        log_message("Failed to open output file %s for %s", filename, endpoint->name);
-        free(chunk.memory);
-        free(begin_date);
-        free(end_date);
-        return -1;
+        log_message("[%s] Failed to open output file %s", endpoint->name, filename);
+        goto cleanup;
     }
-    
+
     if (strcmp(config.export_format, "json") == 0) {
         fprintf(output_file, "{\n\"%s\": [\n", endpoint->key);
     }
-    
-    if (config.debug_mode) {
-        log_message("Starting processing for %s", endpoint->name);
-    }
-    if (config.from_date) {
-    begin_date = strdup(config.from_date);
-    } else {
-        time_t now = time(NULL);
-        time_t start = now - (endpoint->default_date_range_days * 24 * 60 * 60);
-        struct tm *tm_start = localtime(&start);
-        begin_date = malloc(MAX_DATE_LENGTH);
-        if (begin_date) {
-            strftime(begin_date, MAX_DATE_LENGTH, "%Y-%m-%d", tm_start);
-        }
-    }
-    
-    if (config.to_date) {
-        end_date = strdup(config.to_date);
-    } else {
-        end_date = get_current_datetime();
-    }
 
-    if (!begin_date || !end_date) {
-        log_message("[%s] Failed to initialize date range", endpoint->name);
-        result = -1;
-        goto cleanup;
-    }
     pagination.page_number = 1;
     pagination.has_more = true;
-    
+    pagination.records_processed = 0;
+
     while (pagination.has_more && pagination.page_number < config.max_iterations) {
         construct_url(url, sizeof(url), endpoint, last_id, skip, begin_date, end_date, &error);
         if (error.code != 0) {
             handle_error(&error);
             break;
         }
-        
-        add_query_parameters(url, sizeof(url), endpoint);
-        
+
         if (config.verbose_mode) {
             log_message("[%s] Requesting page %d (processed %d records)", 
                        endpoint->name, pagination.page_number, pagination.records_processed);
@@ -1294,57 +1461,50 @@ int process_endpoint(const Endpoint *endpoint) {
                 log_message("URL: %s", url);
             }
         }
-        
-        sleep(config.rate_limit);
-        
+
         bool fetch_success = false;
         for (int retry = 0; retry < config.retry_attempts; retry++) {
             if (fetch_data_with_backoff(url, &chunk, retry + 1, &error) == 0) {
                 fetch_success = true;
                 break;
             }
-            
             handle_error(&error);
-            if (error.code >= 400 && error.code < 500) break; // Don't retry client errors
+            if (error.code >= 400 && error.code < 500) break;
         }
-        
+
         if (!fetch_success) {
             log_message("[%s] Failed to fetch data after %d attempts", 
                        endpoint->name, config.retry_attempts);
             break;
         }
-        
+
         if (config.raw_data_mode) {
             printf("[%s] Raw response:\n%s\n", endpoint->name, chunk.memory);
+            result = 0;
             break;
         }
-        
+
         struct json_object *parsed_json = json_tokener_parse(chunk.memory);
         if (!parsed_json || !validate_response_format(parsed_json, endpoint)) {
             log_message("[%s] Invalid JSON response", endpoint->name);
-            if (config.debug_mode && parsed_json) {
-                log_message("Response: %s", json_object_to_json_string(parsed_json));
-            }
             if (parsed_json) json_object_put(parsed_json);
             break;
         }
-        
+
         struct json_object *items;
         json_object_object_get_ex(parsed_json, endpoint->key, &items);
         int n_items = json_object_array_length(items);
-        
+
         if (config.verbose_mode) {
             log_message("[%s] Received %d records", endpoint->name, n_items);
         }
-        
+
         if (n_items == 0) {
-            if (config.verbose_mode) {
-                log_message("[%s] No more records to process", endpoint->name);
-            }
             json_object_put(parsed_json);
+            result = 0;
             break;
         }
-        
+
         if (strcmp(config.export_format, "csv") == 0) {
             if (first_batch) {
                 write_csv_header(output_file, items, &csv_state);
@@ -1356,8 +1516,6 @@ int process_endpoint(const Endpoint *endpoint) {
                 if (!is_duplicate_record(item, last_id, endpoint->use_timestamp_pagination)) {
                     write_csv_row(output_file, item, !endpoint->use_raw_timestamp, &csv_state);
                     pagination.records_processed++;
-                } else if (config.debug_mode) {
-                    log_message("[%s] Skipping duplicate record", endpoint->name);
                 }
             }
         } else if (strcmp(config.export_format, "json") == 0) {
@@ -1370,19 +1528,17 @@ int process_endpoint(const Endpoint *endpoint) {
                             json_object_array_get_idx(items, i), 
                             JSON_C_TO_STRING_PRETTY));
                 first_batch = false;
+                pagination.records_processed++;
             }
         }
-        
-        if (!update_pagination(endpoint, parsed_json, last_id, last_id_size, 
+
+        if (!update_pagination(endpoint, parsed_json, last_id, sizeof(last_id), 
                              &skip, &begin_date, &end_date)) {
-            if (config.verbose_mode) {
-                log_message("[%s] Pagination complete", endpoint->name);
-            }
             pagination.has_more = false;
         }
-        
+
         json_object_put(parsed_json);
-        
+
         free(chunk.memory);
         chunk.memory = malloc(1);
         if (!chunk.memory) {
@@ -1390,40 +1546,44 @@ int process_endpoint(const Endpoint *endpoint) {
             break;
         }
         chunk.size = 0;
-        
+
         pagination.page_number++;
     }
-    
+
     if (pagination.page_number >= config.max_iterations) {
         log_message("[%s] Reached maximum iteration limit (%d)", 
                    endpoint->name, config.max_iterations);
     }
-    
+
     if (config.verbose_mode) {
         log_message("\n[%s] Complete - Processed %d records in %d pages\n",
                    endpoint->name, pagination.records_processed, pagination.page_number);
     }
-    
+
     if (endpoint->pagination_type != NONE && config.use_cache && config.update_cache) {
         save_cache(cache_filename, last_id);
     }
-    
+
     if (strcmp(config.export_format, "json") == 0) {
         fprintf(output_file, "\n]\n}");
     }
-    
+
+    result = 0;
+
+cleanup:
     if (output_file) fclose(output_file);
-    free(chunk.memory);
-    free(begin_date);
-    free(end_date);
+    if (chunk.memory) free(chunk.memory);
+    if (begin_date) free(begin_date);
+    if (end_date) free(end_date);
     cleanup_csv_state(&csv_state);
-    
+
     return result;
 }
+
 void construct_url(char *url, size_t url_size, const Endpoint *endpoint, 
                   const char *last_id, int skip, const char *begin_date, 
                   const char *end_date, ErrorInfo *error) {
-    if (!url || !endpoint) {
+    if (!url || !endpoint || url_size == 0) {
         if (error) {
             snprintf(error->message, MAX_ERROR_LENGTH, "Invalid parameters for URL construction");
             error->code = -1;
@@ -1431,31 +1591,81 @@ void construct_url(char *url, size_t url_size, const Endpoint *endpoint,
         return;
     }
 
-    if (endpoint->pagination_type == DATE_RANGE && (!begin_date || !end_date)) {
+    memset(url, 0, url_size);
+
+    switch (endpoint->pagination_type) {
+        case DATE_RANGE:
+            if (!begin_date || !end_date) {
+                if (error) {
+                    snprintf(error->message, MAX_ERROR_LENGTH, 
+                            "[%s] Missing date parameters for date-range pagination", 
+                            endpoint->name);
+                    error->code = -1;
+                }
+                return;
+            }
+            if (!validate_date_format(begin_date) || !validate_date_format(end_date)) {
+                if (error) {
+                    snprintf(error->message, MAX_ERROR_LENGTH, 
+                            "[%s] Invalid date format (required: YYYY-MM-DD)", 
+                            endpoint->name);
+                    error->code = -1;
+                }
+                return;
+            }
+            break;
+
+        case TIMESTAMP:
+        case ID:
+            if (!last_id) {
+                if (error) {
+                    snprintf(error->message, MAX_ERROR_LENGTH, 
+                            "[%s] Missing ID/timestamp parameter", 
+                            endpoint->name);
+                    error->code = -1;
+                }
+                return;
+            }
+            break;
+    }
+
+    size_t written = 0;
+    switch (endpoint->pagination_type) {
+        case NONE:
+            written = snprintf(url, url_size, "%s", endpoint->url_format);
+            break;
+
+        case TIMESTAMP:
+        case ID:
+            written = snprintf(url, url_size, endpoint->url_format, last_id);
+            break;
+
+        case SKIP:
+            written = snprintf(url, url_size, endpoint->url_format, last_id, skip);
+            break;
+
+        case DATE_RANGE:
+            written = snprintf(url, url_size, endpoint->url_format, begin_date, end_date);
+            break;
+    }
+
+    if (written >= url_size) {
         if (error) {
             snprintf(error->message, MAX_ERROR_LENGTH, 
-                    "Missing date parameters for date-range pagination");
+                    "[%s] URL buffer too small", 
+                    endpoint->name);
             error->code = -1;
         }
         return;
     }
 
-    switch (endpoint->pagination_type) {
-        case NONE:
-        case TIMESTAMP:
-        case ID:
-            snprintf(url, url_size, endpoint->url_format, last_id);
-            break;
-            
-        case SKIP:
-            snprintf(url, url_size, endpoint->url_format, last_id, skip);
-            break;
-            
-        case DATE_RANGE:
-            snprintf(url, url_size, endpoint->url_format, begin_date, end_date);
-            break;
+    add_query_parameters(url, url_size, endpoint);
+
+    if (config.debug_mode) {
+        log_message("[%s] Constructed URL: %s", endpoint->name, url);
     }
 }
+
 
 void add_query_parameters(char *url, size_t url_size, const Endpoint *endpoint) {
     if (!url || !endpoint) return;
