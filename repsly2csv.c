@@ -13,6 +13,8 @@
 #include <time.h>
 #include <math.h>
 #include <errno.h>
+#include <pthread.h>
+#include <semaphore.h>
 
 /* Constants */
 #define MAX_URL_LENGTH 512
