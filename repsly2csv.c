@@ -1201,8 +1201,8 @@ int process_endpoint(const Endpoint *endpoint) {
     char cache_filename[MAX_URL_LENGTH];
     PaginationState pagination = {0};
     int skip = 0;
-    char *begin_date = config.from_date ? strdup(config.from_date) : NULL;
-    char *end_date = config.to_date ? strdup(config.to_date) : get_current_datetime();
+    char *begin_date = NULL;
+    char *end_date = NULL;
     FILE *output_file = NULL;
     int result = 0;
     CSVState csv_state = {0};
@@ -1252,7 +1252,29 @@ int process_endpoint(const Endpoint *endpoint) {
     if (config.debug_mode) {
         log_message("Starting processing for %s", endpoint->name);
     }
+    if (config.from_date) {
+    begin_date = strdup(config.from_date);
+    } else {
+        time_t now = time(NULL);
+        time_t start = now - (endpoint->default_date_range_days * 24 * 60 * 60);
+        struct tm *tm_start = localtime(&start);
+        begin_date = malloc(MAX_DATE_LENGTH);
+        if (begin_date) {
+            strftime(begin_date, MAX_DATE_LENGTH, "%Y-%m-%d", tm_start);
+        }
+    }
     
+    if (config.to_date) {
+        end_date = strdup(config.to_date);
+    } else {
+        end_date = get_current_datetime();
+    }
+
+    if (!begin_date || !end_date) {
+        log_message("[%s] Failed to initialize date range", endpoint->name);
+        result = -1;
+        goto cleanup;
+    }
     pagination.page_number = 1;
     pagination.has_more = true;
     
