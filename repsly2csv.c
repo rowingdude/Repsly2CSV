@@ -1570,7 +1570,7 @@ int process_endpoint(const Endpoint *endpoint) {
 
     result = 0;
 
-cleanup:
+ cleanup:
     if (output_file) fclose(output_file);
     if (chunk.memory) free(chunk.memory);
     if (begin_date) free(begin_date);
