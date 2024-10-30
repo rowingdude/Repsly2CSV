@@ -607,7 +607,6 @@ void cleanup_thread_pool(ThreadPool* pool) {
 }
 
 void initialize_app(void) {
-    // Set default configuration values
     config.rate_limit = DEFAULT_RATE_LIMIT_SECONDS;
     config.page_size = DEFAULT_PAGE_SIZE;
     config.retry_attempts = DEFAULT_RETRY_ATTEMPTS;
@@ -616,10 +615,13 @@ void initialize_app(void) {
     config.export_format = "csv";
     config.max_iterations = DEFAULT_MAX_ITERATIONS;
     
-    // Initialize CURL
-    initialize_curl();
+    curl_global_init(CURL_GLOBAL_ALL);
+    curl_handle = curl_easy_init();
+    if (!curl_handle) {
+        fprintf(stderr, "Error: Failed to initialize CURL\n");
+        exit(1);
+    }
     
-    // Open log file if specified
     if (config.log_file) {
         log_file_ptr = fopen(config.log_file, "a");
         if (!log_file_ptr) {
@@ -630,10 +632,18 @@ void initialize_app(void) {
 }
 
 void cleanup_app(void) {
-    cleanup_curl();
+    if (curl_handle) {
+        curl_easy_cleanup(curl_handle);
+        curl_handle = NULL;
+    }
+    curl_global_cleanup();
+    
     if (log_file_ptr) {
         fclose(log_file_ptr);
     }
+    
+    pthread_mutex_destroy(&log_mutex);
+    pthread_mutex_destroy(&curl_mutex);
 }
 
 void initialize_curl(void) {
